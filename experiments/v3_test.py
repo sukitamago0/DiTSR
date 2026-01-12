@@ -313,6 +313,8 @@ LR_SCALES = 1e-4
 SAVE_INTERVAL = 50      
 SDE_STRENGTH = 0.5
 TEXTURE_LOSS_WEIGHT = 0.1 # [新增] 纹理损失权重，推荐 0.1
+USE_TEXTURE_LOSS = False
+LOG_PATH = "../experiments_results/overfit_hybrid_v4_texture/train.log"
 # ===========================================
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -398,24 +400,37 @@ def run_hybrid_experiment():
     # -------------------------------------------------------------------------
     if not os.path.exists(LATENT_FILE): print("❌ 数据缺失"); return
     data = torch.load(LATENT_FILE)
-    hr_latent = data["hr_latent"].unsqueeze(0).to(DEVICE).to(DTYPE) 
-    lr_img = data["lr_img"].unsqueeze(0).to(DEVICE).float()
-    
+    hr_latent = data["hr_latent"].unsqueeze(0).to(DEVICE).to(DTYPE)
+    lr_latent_input = None
+    lr_img = None
+
+    if "lr_latent" in data:
+        lr_latent_input = data["lr_latent"].unsqueeze(0).to(DEVICE).float()
+    elif "lr_img" in data:
+        lr_img = data["lr_img"].unsqueeze(0).to(DEVICE).float()
+    else:
+        print("❌ 缺少 lr_latent 或 lr_img，无法继续")
+        return
+
     # 仅用于评估解码，不用梯度
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to("cpu").float()
-    
+
     with torch.no_grad():
-        print("   Encoding LR image to Latent...")
-        # 保持你的参考代码逻辑：在 CPU 做 Encode (或者 GPU)，这里用 CPU 省显存
-        dist = vae.encode(lr_img.cpu()).latent_dist
-        lr_latent_input = dist.sample() * vae.config.scaling_factor
-        lr_latent_input = lr_latent_input.to(DEVICE) # 最终放到 GPU (FP32 by default from cpu float)
-        
+        if lr_latent_input is None:
+            print("   Encoding LR image to Latent...")
+            # 保持你的参考代码逻辑：在 CPU 做 Encode (或者 GPU)，这里用 CPU 省显存
+            dist = vae.encode(lr_img.cpu()).latent_dist
+            lr_latent_input = dist.sample() * vae.config.scaling_factor
+            lr_latent_input = lr_latent_input.to(DEVICE)  # 最终放到 GPU (FP32 by default from cpu float)
+        elif lr_img is None:
+            lr_img = vae.decode(lr_latent_input.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
+            lr_img = torch.clamp((lr_img + 1.0) / 2.0, 0.0, 1.0)
+
         # 简单的诊断打印
         print(f"   👉 Latent Input Std: {lr_latent_input.std().item():.4f}")
-        
+
         hr_img_gt = vae.decode(hr_latent.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
-        hr_img_gt = torch.clamp((hr_img_gt + 1.0) / 2.0, 0.0, 1.0) 
+        hr_img_gt = torch.clamp((hr_img_gt + 1.0) / 2.0, 0.0, 1.0)
 
     y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE).to(DTYPE)
     data_info = {'img_hw': torch.tensor([[512., 512.]]).to(DEVICE).to(DTYPE), 'aspect_ratio': torch.tensor([1.]).to(DEVICE).to(DTYPE)}
@@ -440,8 +455,14 @@ def run_hybrid_experiment():
     # -------------------------------------------------------------------------
     # 5. 训练循环
     # -------------------------------------------------------------------------
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+    def log_line(message):
+        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(f"{message}\n")
+
     losses = []
-    pbar = tqdm(range(STEPS))
+    pbar = tqdm(range(STEPS), dynamic_ncols=True)
     for step in pbar:
         optimizer.zero_grad()
         
@@ -466,15 +487,19 @@ def run_hybrid_experiment():
             # 1. MSE Loss (基础)
             loss_mse = F.mse_loss(model_out, noise)
             
-            # 2. Texture Loss (新增，解决油画感)
-            # 反推 x0 (Latent Space)
-            pred_latents = predict_x0_from_eps(noisy_input.float(), model_out.float(), t)
-            
-            # 计算纹理损失 (Input: Float32)
-            # hr_latent 是 FP16, 需要转 float 对齐
-            loss_tex = latent_texture_loss(pred_latents, hr_latent.float())
-            
-            loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
+            loss_tex = None
+            if USE_TEXTURE_LOSS:
+                # 2. Texture Loss (新增，解决油画感)
+                # 反推 x0 (Latent Space)
+                pred_latents = predict_x0_from_eps(noisy_input.float(), model_out.float(), t)
+                
+                # 计算纹理损失 (Input: Float32)
+                # hr_latent 是 FP16, 需要转 float 对齐
+                loss_tex = latent_texture_loss(pred_latents, hr_latent.float())
+                
+                loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
+            else:
+                loss = loss_mse
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -487,16 +512,18 @@ def run_hybrid_experiment():
         else:
             adapter_abs_mean = adapter_cond.abs().mean().item()
             
-        pbar.set_postfix({
+        postfix = {
             "Loss": f"{loss.item():.4f}", 
             "MSE": f"{loss_mse.item():.4f}",
-            "Tex": f"{loss_tex.item():.4f}",
             "Adp": f"{adapter_abs_mean:.4f}"
-        })
+        }
+        if loss_tex is not None:
+            postfix["Tex"] = f"{loss_tex.item():.4f}"
+        pbar.set_postfix(postfix)
         
         if (step + 1) % SAVE_INTERVAL == 0:
             input_scales = [f"{s.item():.4f}" for s in pixart.injection_scales]
-            print(f"\n🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
+            log_line(f"🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
 
             # 评估时使用 LPIPS 监控质量
             metrics = evaluate_and_save(
@@ -505,12 +532,16 @@ def run_hybrid_experiment():
                 step, hr_img_gt, hr_latent
             )
             
-            print(f"📊 Report:")
-            print(f"   📉 Loss: {loss.item():.6f}")
-            print(f"   🎛️ Input Scales: {input_scales}")
+            log_line("📊 Report:")
+            log_line(f"   📉 Loss: {loss.item():.6f}")
+            log_line(f"   🎛️ Input Scales: {input_scales}")
             if metrics:
-                print(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
-            print("-" * 50)
+                log_line(
+                    "   🖼️ PSNR: "
+                    f"{metrics['psnr']:.2f} | SSIM: {metrics['ssim']:.4f} | "
+                    f"LPIPS: {metrics['lpips']:.4f}"
+                )
+            log_line("-" * 50)
 
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
@@ -548,22 +579,24 @@ def evaluate_and_save(model, adapter, vae, lr_latent_input, lr_img, y_embed, dat
         gen_std = latents.float().std().item()
         gt_mean = hr_latent.float().mean().item()
         gt_std = hr_latent.float().std().item()
-        print(f"\n🧐 [DIAGNOSTIC] Final Latent Stats | Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}")
+        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                "🧐 [DIAGNOSTIC] Final Latent Stats | "
+                f"Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}\n"
+            )
             
         pred_img = vae.decode(latents.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
-        pred_img_clamp = torch.clamp(pred_img, -1.0, 1.0)
+        pred_img = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
     metrics = {}
     if USE_METRICS:
-        pred_norm_01 = (pred_img_clamp / 2 + 0.5).clamp(0, 1)
-        gt_norm_01 = (hr_img_gt / 2 + 0.5).clamp(0, 1)
-        
-        metrics['psnr'] = psnr(pred_norm_01, gt_norm_01, data_range=1.0).item()
-        metrics['ssim'] = ssim(pred_norm_01, gt_norm_01, data_range=1.0).item()
-        metrics['lpips'] = lpips_fn(pred_img_clamp, hr_img_gt).item() # Eval LPIPS uses FP32 images here
+        metrics['psnr'] = psnr(pred_img, hr_img_gt, data_range=1.0).item()
+        metrics['ssim'] = ssim(pred_img, hr_img_gt, data_range=1.0).item()
+        pred_norm = pred_img * 2.0 - 1.0
+        gt_norm = hr_img_gt * 2.0 - 1.0
+        metrics['lpips'] = lpips_fn(pred_norm, gt_norm).item()
 
-    pred_np = pred_img_clamp[0].permute(1, 2, 0).detach().cpu().numpy()
-    pred_np = (pred_np / 2 + 0.5).clip(0, 1)
+    pred_np = pred_img[0].permute(1, 2, 0).detach().cpu().numpy()
     
     lr_np = ((lr_img[0].cpu().permute(1, 2, 0) + 1) / 2).clamp(0, 1).numpy()
     
