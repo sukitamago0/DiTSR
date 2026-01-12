@@ -313,6 +313,8 @@ LR_SCALES = 1e-4
 SAVE_INTERVAL = 50      
 SDE_STRENGTH = 0.5
 TEXTURE_LOSS_WEIGHT = 0.1 # [新增] 纹理损失权重，推荐 0.1
+USE_TEXTURE_LOSS = False
+LOG_PATH = "../experiments_results/overfit_hybrid_v4_texture/train.log"
 # ===========================================
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -453,6 +455,12 @@ def run_hybrid_experiment():
     # -------------------------------------------------------------------------
     # 5. 训练循环
     # -------------------------------------------------------------------------
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+    def log_line(message):
+        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(f"{message}\n")
+
     losses = []
     pbar = tqdm(range(STEPS), dynamic_ncols=True)
     for step in pbar:
@@ -479,15 +487,19 @@ def run_hybrid_experiment():
             # 1. MSE Loss (基础)
             loss_mse = F.mse_loss(model_out, noise)
             
-            # 2. Texture Loss (新增，解决油画感)
-            # 反推 x0 (Latent Space)
-            pred_latents = predict_x0_from_eps(noisy_input.float(), model_out.float(), t)
-            
-            # 计算纹理损失 (Input: Float32)
-            # hr_latent 是 FP16, 需要转 float 对齐
-            loss_tex = latent_texture_loss(pred_latents, hr_latent.float())
-            
-            loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
+            loss_tex = None
+            if USE_TEXTURE_LOSS:
+                # 2. Texture Loss (新增，解决油画感)
+                # 反推 x0 (Latent Space)
+                pred_latents = predict_x0_from_eps(noisy_input.float(), model_out.float(), t)
+                
+                # 计算纹理损失 (Input: Float32)
+                # hr_latent 是 FP16, 需要转 float 对齐
+                loss_tex = latent_texture_loss(pred_latents, hr_latent.float())
+                
+                loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
+            else:
+                loss = loss_mse
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -500,16 +512,18 @@ def run_hybrid_experiment():
         else:
             adapter_abs_mean = adapter_cond.abs().mean().item()
             
-        pbar.set_postfix({
+        postfix = {
             "Loss": f"{loss.item():.4f}", 
             "MSE": f"{loss_mse.item():.4f}",
-            "Tex": f"{loss_tex.item():.4f}",
             "Adp": f"{adapter_abs_mean:.4f}"
-        })
+        }
+        if loss_tex is not None:
+            postfix["Tex"] = f"{loss_tex.item():.4f}"
+        pbar.set_postfix(postfix)
         
         if (step + 1) % SAVE_INTERVAL == 0:
             input_scales = [f"{s.item():.4f}" for s in pixart.injection_scales]
-            pbar.write(f"🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
+            log_line(f"🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
 
             # 评估时使用 LPIPS 监控质量
             metrics = evaluate_and_save(
@@ -518,12 +532,12 @@ def run_hybrid_experiment():
                 step, hr_img_gt, hr_latent
             )
             
-            pbar.write("📊 Report:")
-            pbar.write(f"   📉 Loss: {loss.item():.6f}")
-            pbar.write(f"   🎛️ Input Scales: {input_scales}")
+            log_line("📊 Report:")
+            log_line(f"   📉 Loss: {loss.item():.6f}")
+            log_line(f"   🎛️ Input Scales: {input_scales}")
             if metrics:
-                pbar.write(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
-            pbar.write("-" * 50)
+                log_line(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
+            log_line("-" * 50)
 
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
@@ -561,9 +575,11 @@ def evaluate_and_save(model, adapter, vae, lr_latent_input, lr_img, y_embed, dat
         gen_std = latents.float().std().item()
         gt_mean = hr_latent.float().mean().item()
         gt_std = hr_latent.float().std().item()
-        tqdm.write(
-            f"🧐 [DIAGNOSTIC] Final Latent Stats | Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}"
-        )
+        with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                "🧐 [DIAGNOSTIC] Final Latent Stats | "
+                f"Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}\n"
+            )
             
         pred_img = vae.decode(latents.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
         pred_img = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
