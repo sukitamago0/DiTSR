@@ -454,7 +454,7 @@ def run_hybrid_experiment():
     # 5. 训练循环
     # -------------------------------------------------------------------------
     losses = []
-    pbar = tqdm(range(STEPS))
+    pbar = tqdm(range(STEPS), dynamic_ncols=True)
     for step in pbar:
         optimizer.zero_grad()
         
@@ -509,7 +509,7 @@ def run_hybrid_experiment():
         
         if (step + 1) % SAVE_INTERVAL == 0:
             input_scales = [f"{s.item():.4f}" for s in pixart.injection_scales]
-            print(f"\n🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
+            pbar.write(f"🔍 [Monitor] Step {step+1} Adapter Mean: {adapter_abs_mean:.6f}")
 
             # 评估时使用 LPIPS 监控质量
             metrics = evaluate_and_save(
@@ -518,12 +518,12 @@ def run_hybrid_experiment():
                 step, hr_img_gt, hr_latent
             )
             
-            print(f"📊 Report:")
-            print(f"   📉 Loss: {loss.item():.6f}")
-            print(f"   🎛️ Input Scales: {input_scales}")
+            pbar.write("📊 Report:")
+            pbar.write(f"   📉 Loss: {loss.item():.6f}")
+            pbar.write(f"   🎛️ Input Scales: {input_scales}")
             if metrics:
-                print(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
-            print("-" * 50)
+                pbar.write(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
+            pbar.write("-" * 50)
 
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
@@ -561,22 +561,22 @@ def evaluate_and_save(model, adapter, vae, lr_latent_input, lr_img, y_embed, dat
         gen_std = latents.float().std().item()
         gt_mean = hr_latent.float().mean().item()
         gt_std = hr_latent.float().std().item()
-        print(f"\n🧐 [DIAGNOSTIC] Final Latent Stats | Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}")
+        tqdm.write(
+            f"🧐 [DIAGNOSTIC] Final Latent Stats | Gen: u={gen_mean:.3f},s={gen_std:.3f} | GT: u={gt_mean:.3f},s={gt_std:.3f}"
+        )
             
         pred_img = vae.decode(latents.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
-        pred_img_clamp = torch.clamp(pred_img, -1.0, 1.0)
+        pred_img = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
     metrics = {}
     if USE_METRICS:
-        pred_norm_01 = (pred_img_clamp / 2 + 0.5).clamp(0, 1)
-        gt_norm_01 = (hr_img_gt / 2 + 0.5).clamp(0, 1)
-        
-        metrics['psnr'] = psnr(pred_norm_01, gt_norm_01, data_range=1.0).item()
-        metrics['ssim'] = ssim(pred_norm_01, gt_norm_01, data_range=1.0).item()
-        metrics['lpips'] = lpips_fn(pred_img_clamp, hr_img_gt).item() # Eval LPIPS uses FP32 images here
+        metrics['psnr'] = psnr(pred_img, hr_img_gt, data_range=1.0).item()
+        metrics['ssim'] = ssim(pred_img, hr_img_gt, data_range=1.0).item()
+        pred_norm = pred_img * 2.0 - 1.0
+        gt_norm = hr_img_gt * 2.0 - 1.0
+        metrics['lpips'] = lpips_fn(pred_norm, gt_norm).item()
 
-    pred_np = pred_img_clamp[0].permute(1, 2, 0).detach().cpu().numpy()
-    pred_np = (pred_np / 2 + 0.5).clip(0, 1)
+    pred_np = pred_img[0].permute(1, 2, 0).detach().cpu().numpy()
     
     lr_np = ((lr_img[0].cpu().permute(1, 2, 0) + 1) / 2).clamp(0, 1).numpy()
     
