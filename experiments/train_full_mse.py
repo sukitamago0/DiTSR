@@ -55,6 +55,7 @@ SDE_STRENGTH = 0.5
 USE_REALISTIC_DEGRADATION = True
 BLUR_KERNEL_SIZES = [3, 5, 7]
 NOISE_STD_RANGE = (0.0, 0.02)
+VALIDATION_STEPS = 20
 
 # -----------------------------------------------------------------------------
 # 2. 导入项目模块
@@ -319,6 +320,7 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
         return out
 
     start_t = int(1000 * SDE_STRENGTH)
+    step_indices = torch.linspace(start_t, 0, VALIDATION_STEPS, device=DEVICE).long()
     
     total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
     count = 0
@@ -346,12 +348,13 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
                 "data_info": data_info,
                 "adapter_cond": cond,
             }
-            for step in reversed(range(start_t + 1)):
-                t_tensor = torch.tensor([step], device=DEVICE).long()
-                latents = diffusion.p_sample(
+            for step in step_indices:
+                t_tensor = step.view(1)
+                latents = diffusion.ddim_sample(
                     model_with_adapter,
                     latents,
                     t_tensor,
+                    eta=0.0,
                     model_kwargs=model_kwargs,
                 )["sample"]
             
