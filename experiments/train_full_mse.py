@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 # [1] 导入所需组件
-from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
+from diffusers import AutoencoderKL
 from torch.cuda.amp import GradScaler
 from torch.utils.data import Dataset, DataLoader
 import os
@@ -17,6 +17,8 @@ import numpy as np
 import gc
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import functional as TF
+import random
 
 # -----------------------------------------------------------------------------
 # 1. 环境与配置
@@ -49,7 +51,10 @@ LR_ADAPTER = 1e-5
 LR_SCALES = 1e-4         
 SAVE_INTERVAL_EPOCH = 1 # 每轮保存并验证
 SDE_STRENGTH = 0.6      
-TEXTURE_LOSS_WEIGHT = 0.1 # 训练时使用的 Latent 纹理损失权重
+# 验证退化策略
+USE_REALISTIC_DEGRADATION = True
+BLUR_KERNEL_SIZES = [3, 5, 7]
+NOISE_STD_RANGE = (0.0, 0.02)
 
 # -----------------------------------------------------------------------------
 # 2. 导入项目模块
@@ -114,7 +119,16 @@ class ValidImageDataset(Dataset):
         hr_tensor = self.transform(hr_img)
         
         # 模拟退化：Downsample -> Upsample
-        lr_small = F.interpolate(hr_tensor.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
+        if USE_REALISTIC_DEGRADATION:
+            blur_k = random.choice(BLUR_KERNEL_SIZES)
+            hr_blur = TF.gaussian_blur(hr_tensor, blur_k)
+            lr_small = F.interpolate(hr_blur.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
+            noise_std = random.uniform(*NOISE_STD_RANGE)
+            if noise_std > 0:
+                lr_small = lr_small + torch.randn_like(lr_small) * noise_std
+                lr_small = lr_small.clamp(-1.0, 1.0)
+        else:
+            lr_small = F.interpolate(hr_tensor.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
         lr_tensor = F.interpolate(lr_small, size=(512, 512), mode='bicubic', align_corners=False).squeeze(0)
         
         return {
@@ -205,16 +219,6 @@ def train_full_production():
     data_info = {'img_hw': torch.tensor([[512., 512.]]).to(DEVICE).to(DTYPE), 'aspect_ratio': torch.tensor([1.]).to(DEVICE).to(DTYPE)}
 
     # --- Helpers ---
-    def predict_x0(x_t, eps, t):
-        acp = torch.from_numpy(diffusion.alphas_cumprod).to(x_t.device).to(x_t.dtype)
-        at = acp[t]
-        return (x_t - (1 - at).sqrt().view(-1, 1, 1, 1) * eps) / at.sqrt().view(-1, 1, 1, 1)
-
-    def latent_texture_loss(pred, target):
-        p_dx = pred[..., 1:] - pred[..., :-1]; p_dy = pred[..., 1:, :] - pred[..., :-1, :]
-        t_dx = target[..., 1:] - target[..., :-1]; t_dy = target[..., 1:, :] - target[..., :-1, :]
-        return F.l1_loss(p_dx, t_dx) + F.l1_loss(p_dy, t_dy)
-
     # -------------------------------------------------------------------------
     # 5. Training Loop
     # -------------------------------------------------------------------------
@@ -230,12 +234,18 @@ def train_full_production():
         for i, batch in enumerate(pbar):
             # Data
             hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE)
-            lr_img = batch["lr_img"].to(DEVICE).to(DTYPE)
-            
-            # Encode LR (On-the-fly)
-            with torch.no_grad():
-                dist = vae.encode(lr_img).latent_dist
-                lr_latent = dist.sample() * vae.config.scaling_factor
+            lr_img = batch.get("lr_img")
+
+            # Encode LR (On-the-fly) or use cached latent if provided
+            if "lr_latent" in batch:
+                lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE)
+            elif lr_img is not None:
+                lr_img = lr_img.to(DEVICE).to(DTYPE)
+                with torch.no_grad():
+                    dist = vae.encode(lr_img).latent_dist
+                    lr_latent = dist.sample() * vae.config.scaling_factor
+            else:
+                raise KeyError("Batch must contain either 'lr_latent' or 'lr_img'.")
             
             # Noise
             current_bs = hr_latent.shape[0]
@@ -258,14 +268,8 @@ def train_full_production():
                 )
                 if model_out.shape[1] == 8: model_out, _ = model_out.chunk(2, dim=1)
                 
-                # Loss Calculation
-                loss_mse = F.mse_loss(model_out, noise)
-                
-                # Texture Loss (Low VRAM alternative to LPIPS)
-                pred_x0 = predict_x0(noisy_input.float(), model_out.float(), t)
-                loss_tex = latent_texture_loss(pred_x0, hr_latent.float())
-                
-                loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
+                # Loss Calculation (MSE baseline)
+                loss = F.mse_loss(model_out, noise)
                 
                 # Gradient Accumulation
                 loss = loss / GRAD_ACCUM_STEPS
@@ -294,19 +298,26 @@ def train_full_production():
             gc.collect()
             torch.cuda.empty_cache()
             
-            run_production_validation(epoch, pixart, adapter, vae, valid_loader, y_embed, data_info)
+            run_production_validation(epoch, pixart, adapter, vae, valid_loader, y_embed, data_info, diffusion)
 
-def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, data_info):
+def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, data_info, diffusion):
     model.eval()
     adapter.eval()
-    
-    # [核心修正] 1. 手动实例化 Scheduler，避免从文件加载配置出错
-    scheduler = DPMSolverMultistepScheduler(
-        num_train_timesteps=1000,
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
-        solver_order=2
-    )
-    
+
+    def model_with_adapter(x, t, y_embed, data_info, adapter_cond):
+        with torch.cuda.amp.autocast():
+            out = model(
+                x,
+                t,
+                y_embed,
+                data_info=data_info,
+                adapter_cond=adapter_cond,
+                injection_mode="hybrid",
+            )
+        if out.shape[1] == 8:
+            out, _ = out.chunk(2, dim=1)
+        return out
+
     start_t = int(1000 * SDE_STRENGTH)
     
     total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
@@ -314,9 +325,6 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
     
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
-            # [核心修正] 2. 每次处理图片前重置 Timesteps，清除 DPM 历史状态
-            scheduler.set_timesteps(20)
-            timesteps = [t for t in scheduler.timesteps if t <= start_t]
             t_start_tensor = torch.tensor([start_t], device=DEVICE).long()
 
             hr_img = batch['hr_img'].to(DEVICE).to(DTYPE)
@@ -328,18 +336,24 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
             
             # Noise
             g = torch.Generator(DEVICE).manual_seed(42 + idx)
-            latents = lr_latent.clone()
-            noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
-            latents = scheduler.add_noise(latents, noise, t_start_tensor)
-            
-            # Inference
+            noise = torch.randn(lr_latent.shape, generator=g, device=DEVICE, dtype=lr_latent.dtype)
+            latents = diffusion.q_sample(lr_latent, t_start_tensor, noise)
+
+            # Inference (match training noise schedule)
             cond = adapter(lr_latent.float())
-            for t in timesteps:
-                t_tensor = t.unsqueeze(0).to(DEVICE)
-                with torch.cuda.amp.autocast():
-                    out = model(latents, t_tensor, y_embed, data_info=data_info, adapter_cond=cond, injection_mode='hybrid')
-                if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
-                latents = scheduler.step(out, t, latents).prev_sample
+            model_kwargs = {
+                "y_embed": y_embed,
+                "data_info": data_info,
+                "adapter_cond": cond,
+            }
+            for step in reversed(range(start_t + 1)):
+                t_tensor = torch.tensor([step], device=DEVICE).long()
+                latents = diffusion.p_sample(
+                    model_with_adapter,
+                    latents,
+                    t_tensor,
+                    model_kwargs=model_kwargs,
+                )["sample"]
             
             # Decode & Metrics
             if USE_METRICS or idx == 0:
