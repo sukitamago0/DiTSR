@@ -163,3 +163,20 @@ output/
 #cache for docker
 docker/cache/gradio
 docker/cache/huggingface
+
+# ===== Dataset & Outputs (DO NOT TRACK) =====
+dataset/
+output/
+
+# ===== Experiment results / logs =====
+experiments_results/
+*.log
+
+# ===== Python cache =====
+__pycache__/
+*.pyc
+
+# ===== OS / Editor =====
+.DS_Store
+.idea/
+.vscode/
