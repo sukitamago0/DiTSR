@@ -63,9 +63,9 @@ def process_file(path, vae, device, overwrite=False, output_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Offline LR latent extraction (aligned with existing HR latents).")
-    parser.add_argument("--input_dir", type=str, default="../dataset/DIV2K_train_latents",
+    parser.add_argument("--input_dir", type=str, default="dataset/DIV2K_train_latents",
                         help="Directory with existing .pt samples (lr_img + hr_latent).")
-    parser.add_argument("--vae_path", type=str, default="../output/pretrained_models/sd-vae-ft-ema",
+    parser.add_argument("--vae_path", type=str, default="output/pretrained_models/sd-vae-ft-ema",
                         help="Path to VAE model.")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Optional output directory (default: overwrite in place).")

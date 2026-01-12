@@ -19,9 +19,9 @@ torch.backends.cudnn.enabled = False
 # ==============================================================
 
 # ================= 🔧 默认配置 =================
-HR_DIR = "../dataset/DIV2K_train_HR"
-OUTPUT_DIR = "../dataset/DIV2K_train_latents"
-VAE_PATH = "../output/pretrained_models/sd-vae-ft-ema"
+HR_DIR = "dataset/DIV2K_train_HR"
+OUTPUT_DIR = "dataset/DIV2K_train_latents"
+VAE_PATH = "output/pretrained_models/sd-vae-ft-ema"
 
 CROP_SIZE = 512
 STRIDE = 256  # 50% 重叠
