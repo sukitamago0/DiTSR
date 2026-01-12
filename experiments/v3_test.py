@@ -398,24 +398,37 @@ def run_hybrid_experiment():
     # -------------------------------------------------------------------------
     if not os.path.exists(LATENT_FILE): print("❌ 数据缺失"); return
     data = torch.load(LATENT_FILE)
-    hr_latent = data["hr_latent"].unsqueeze(0).to(DEVICE).to(DTYPE) 
-    lr_img = data["lr_img"].unsqueeze(0).to(DEVICE).float()
-    
+    hr_latent = data["hr_latent"].unsqueeze(0).to(DEVICE).to(DTYPE)
+    lr_latent_input = None
+    lr_img = None
+
+    if "lr_latent" in data:
+        lr_latent_input = data["lr_latent"].unsqueeze(0).to(DEVICE).float()
+    elif "lr_img" in data:
+        lr_img = data["lr_img"].unsqueeze(0).to(DEVICE).float()
+    else:
+        print("❌ 缺少 lr_latent 或 lr_img，无法继续")
+        return
+
     # 仅用于评估解码，不用梯度
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to("cpu").float()
-    
+
     with torch.no_grad():
-        print("   Encoding LR image to Latent...")
-        # 保持你的参考代码逻辑：在 CPU 做 Encode (或者 GPU)，这里用 CPU 省显存
-        dist = vae.encode(lr_img.cpu()).latent_dist
-        lr_latent_input = dist.sample() * vae.config.scaling_factor
-        lr_latent_input = lr_latent_input.to(DEVICE) # 最终放到 GPU (FP32 by default from cpu float)
-        
+        if lr_latent_input is None:
+            print("   Encoding LR image to Latent...")
+            # 保持你的参考代码逻辑：在 CPU 做 Encode (或者 GPU)，这里用 CPU 省显存
+            dist = vae.encode(lr_img.cpu()).latent_dist
+            lr_latent_input = dist.sample() * vae.config.scaling_factor
+            lr_latent_input = lr_latent_input.to(DEVICE)  # 最终放到 GPU (FP32 by default from cpu float)
+        elif lr_img is None:
+            lr_img = vae.decode(lr_latent_input.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
+            lr_img = torch.clamp((lr_img + 1.0) / 2.0, 0.0, 1.0)
+
         # 简单的诊断打印
         print(f"   👉 Latent Input Std: {lr_latent_input.std().item():.4f}")
-        
+
         hr_img_gt = vae.decode(hr_latent.cpu().float() / vae.config.scaling_factor).sample.to(DEVICE)
-        hr_img_gt = torch.clamp((hr_img_gt + 1.0) / 2.0, 0.0, 1.0) 
+        hr_img_gt = torch.clamp((hr_img_gt + 1.0) / 2.0, 0.0, 1.0)
 
     y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE).to(DTYPE)
     data_info = {'img_hw': torch.tensor([[512., 512.]]).to(DEVICE).to(DTYPE), 'aspect_ratio': torch.tensor([1.]).to(DEVICE).to(DTYPE)}
