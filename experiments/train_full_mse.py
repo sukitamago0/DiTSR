@@ -28,9 +28,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 torch.backends.cudnn.enabled = False
 
 # 路径配置
-TRAIN_DATASET_DIR = "../dataset/DIV2K_train_latents/" 
+TRAIN_DATASET_DIR = "../dataset/DIV2K_train_latents/"
 # 指向包含 HR 原图的验证集文件夹 (png/jpg)
-VALID_DATASET_DIR = "../dataset/DIV2K_valid_HR/"
+VALID_DATASET_DIR = "/home/never/jietian/PixArt-alpha/dataset/DIV2K_valid_HR"
 
 CHECKPOINT_DIR = "../output/checkpoints/hybrid_production_v1/"
 VIS_DIR = os.path.join(CHECKPOINT_DIR, "vis")
@@ -43,14 +43,14 @@ DEVICE = "cuda"
 DTYPE = torch.float16
 
 # [训练超参]
-NUM_EPOCHS = 100        
+NUM_EPOCHS = 100
 BATCH_SIZE = 1          # 3070 8G 物理限制
 GRAD_ACCUM_STEPS = 4    # 等效 Batch Size = 4
 NUM_WORKERS = 2         
 LR_ADAPTER = 1e-5       
 LR_SCALES = 1e-4         
-SAVE_INTERVAL_EPOCH = 1 # 每轮保存并验证
-SDE_STRENGTH = 0.6      
+SAVE_INTERVAL_EPOCH = 2 # 每两轮保存并验证
+SDE_STRENGTH = 0.5
 # 验证退化策略
 USE_REALISTIC_DEGRADATION = True
 BLUR_KERNEL_SIZES = [3, 5, 7]
@@ -228,7 +228,7 @@ def train_full_production():
         pixart.train()
         adapter.train()
         
-        pbar = tqdm(train_loader, desc="Training")
+        pbar = tqdm(train_loader, desc="Training", dynamic_ncols=True)
         optimizer.zero_grad()
         
         for i, batch in enumerate(pbar):
@@ -324,7 +324,7 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
     count = 0
     
     with torch.no_grad():
-        for idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
+        for idx, batch in enumerate(tqdm(val_loader, desc="Validating", dynamic_ncols=True)):
             t_start_tensor = torch.tensor([start_t], device=DEVICE).long()
 
             hr_img = batch['hr_img'].to(DEVICE).to(DTYPE)
