@@ -536,7 +536,11 @@ def run_hybrid_experiment():
             log_line(f"   📉 Loss: {loss.item():.6f}")
             log_line(f"   🎛️ Input Scales: {input_scales}")
             if metrics:
-                log_line(f"   🖼️ PSNR: {metrics['psnr']:.2f} | LPIPS: {metrics['lpips']:.4f}")
+                log_line(
+                    "   🖼️ PSNR: "
+                    f"{metrics['psnr']:.2f} | SSIM: {metrics['ssim']:.4f} | "
+                    f"LPIPS: {metrics['lpips']:.4f}"
+                )
             log_line("-" * 50)
 
     plt.figure(figsize=(10, 5))
