@@ -1,395 +1,766 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-# [1] 导入所需组件
-from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
-from torch.cuda.amp import GradScaler
-from torch.utils.data import Dataset, DataLoader
+# experiments/train_full_mse.py
 import os
 import sys
 import glob
-# [2] 强制非交互后端，防止服务器报错
-import matplotlib
-matplotlib.use('Agg') 
+import io
+import math
+import random
+import hashlib  # $$ [MOD-SEED-1] 用稳定 hash，替代 Python 内置 hash（跨进程/跨天不稳定）
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import numpy as np
-import gc
-from PIL import Image
-from torchvision import transforms
 
-# -----------------------------------------------------------------------------
-# 1. 环境与配置
-# -----------------------------------------------------------------------------
-# 显存碎片优化
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
+from torch.cuda.amp import GradScaler
+
+import numpy as np  # $$ [MOD-IMG-1] 用 np.asarray(pil) 读取图片，避免 TypedStorage 警告且更标准
+
+# -------------------------
+# 0) 环境硬约束（你自己一直在用）
+# -------------------------
 torch.backends.cudnn.enabled = False
 
-# 路径配置
-TRAIN_DATASET_DIR = "../dataset/DIV2K_train_latents/" 
-# 指向包含 HR 原图的验证集文件夹 (png/jpg)
-VALID_DATASET_DIR = "../dataset/DIV2K_valid_HR/"
-
-CHECKPOINT_DIR = "../output/checkpoints/hybrid_production_v1/"
-VIS_DIR = os.path.join(CHECKPOINT_DIR, "vis")
-
-PIXART_PATH = "../output/pretrained_models/PixArt-XL-2-512x512.pth"
-VAE_PATH = "../output/pretrained_models/sd-vae-ft-ema"
-T5_EMBED_PATH = "../output/quality_embed.pth" 
-
-DEVICE = "cuda"
-DTYPE = torch.float16
-
-# [训练超参]
-NUM_EPOCHS = 100        
-BATCH_SIZE = 1          # 3070 8G 物理限制
-GRAD_ACCUM_STEPS = 4    # 等效 Batch Size = 4
-NUM_WORKERS = 2         
-LR_ADAPTER = 1e-5       
-LR_SCALES = 1e-4         
-SAVE_INTERVAL_EPOCH = 1 # 每轮保存并验证
-SDE_STRENGTH = 0.6      
-TEXTURE_LOSS_WEIGHT = 0.1 # 训练时使用的 Latent 纹理损失权重
-
-# -----------------------------------------------------------------------------
-# 2. 导入项目模块
-# -----------------------------------------------------------------------------
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-try:
-    from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
-    from diffusion.model.nets.adapter import MultiLevelAdapter
-    from diffusion import IDDPM
-except ImportError as e:
-    print(f"❌ 导入失败: {e}")
-    sys.exit(1)
-
-# -----------------------------------------------------------------------------
-# 3. 评估指标 (仅用于验证阶段，不占用训练显存)
-# -----------------------------------------------------------------------------
+# -------------------------
+# 1) Metrics
+# -------------------------
 try:
     from torchmetrics.functional import peak_signal_noise_ratio as psnr
     from torchmetrics.functional import structural_similarity_index_measure as ssim
     import lpips
     USE_METRICS = True
-    # 初始化 LPIPS 用于验证打分
-    val_lpips_fn = lpips.LPIPS(net='vgg').to(DEVICE).to(DTYPE).eval()
-    for p in val_lpips_fn.parameters(): p.requires_grad = False
-    print("✅ Metrics libraries loaded.")
+    print("✅ Metrics libraries loaded (PSNR, SSIM, LPIPS).")
 except ImportError:
     USE_METRICS = False
-    print("⚠️ Metrics libraries missing. Validation will only generate images.")
+    print("⚠️ Metrics missing. Install: pip install torchmetrics lpips")
 
-# ==============================================================================
-# 数据集定义
-# ==============================================================================
+# -------------------------
+# 2) 路径与超参（按 3070 8G 默认）
+# -------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(PROJECT_ROOT)
+
+TRAIN_LATENT_DIR = "/home/never/jietian/PixArt-alpha/dataset/DIV2K_train_latents_v2"
+VAL_HR_DIR = os.path.join(PROJECT_ROOT, "dataset", "DIV2K_valid_HR")
+
+PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-XL-2-512x512.pth")
+VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
+T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "quality_embed.pth")
+
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_full_mse")
+os.makedirs(OUT_DIR, exist_ok=True)
+CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
+VIS_DIR  = os.path.join(OUT_DIR, "vis")
+os.makedirs(CKPT_DIR, exist_ok=True)
+os.makedirs(VIS_DIR, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE_PIXART = torch.float16  # PixArt 主干用 FP16 省显存
+DTYPE_LATENT = torch.float16  # 你离线 latent 就是 FP16
+USE_AMP = (DEVICE == "cuda")
+
+EPOCHS = 100
+BATCH_SIZE = 1
+NUM_WORKERS = 0
+LR_ADAPTER = 1e-5
+LR_SCALES  = 1e-4
+GRAD_ACCUM_STEPS = 1
+
+SMOKE = False
+SMOKE_TRAIN_SAMPLES = 20
+SMOKE_VAL_SAMPLES = 20
+
+NUM_INFER_STEPS = 20
+SDE_STRENGTH = 0.45
+FIXED_NOISE_SEED = 42
+
+VAL_DEGRADE_MODE = "realistic"  # "realistic" / "bicubic"
+
+PSNR_SWITCH = 24.0
+KEEP_LAST_EPOCHS = 3
+KEEP_TOPK = 1
+
+# $$ [MOD-METRIC-1] SR 论文常见规范：PSNR/SSIM 在 Y(亮度) 通道算；LPIPS 在 RGB 上算
+METRIC_Y_CHANNEL = True
+# $$ [MOD-METRIC-2] 常见 SR 评估会 shave border（x4 通常=4）。如果你想“完全不裁边”，设为 0。
+METRIC_SHAVE_BORDER = 4
+
+# $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
+LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
+
+# -------------------------
+# 3) 导入你的模型
+# -------------------------
+try:
+    from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
+    from diffusion.model.nets.adapter import MultiLevelAdapter
+    from diffusion import IDDPM
+except ImportError as e:
+    print(f"❌ Import failed: {e}")
+    raise
+
+# -------------------------
+# 4) 数据集：训练用离线 latent（hr_latent/lr_latent）
+# -------------------------
 class TrainLatentDataset(Dataset):
-    def __init__(self, root_dir):
-        self.files = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
-        if len(self.files) == 0: raise ValueError(f"❌ No .pt files in {root_dir}")
-        print(f"📂 Training Set: Found {len(self.files)} samples.")
+    def __init__(self, root_dir: str, max_files: Optional[int] = None):
+        self.root_dir = root_dir
+        self.paths = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
+        if max_files is not None:
+            self.paths = self.paths[:max_files]
+        if len(self.paths) == 0:
+            raise FileNotFoundError(f"No .pt files found in: {root_dir}")
 
-    def __len__(self): return len(self.files)
+    def __len__(self):
+        return len(self.paths)
+
     def __getitem__(self, idx):
-        # 包含 {'hr_latent': ..., 'lr_img': ...}
-        data = torch.load(self.files[idx], map_location="cpu")
-        return data
+        d = torch.load(self.paths[idx], map_location="cpu")
+        hr = d["hr_latent"]  # [4,64,64] fp16
+        lr = d["lr_latent"]  # [4,64,64] fp16
+        return {"hr_latent": hr, "lr_latent": lr, "path": self.paths[idx]}
 
-class ValidImageDataset(Dataset):
-    def __init__(self, root_dir):
-        self.files = sorted(glob.glob(os.path.join(root_dir, "*.png")) + 
-                            glob.glob(os.path.join(root_dir, "*.jpg")))
-        if len(self.files) == 0: print(f"⚠️ Warning: No images found in {root_dir}")
-        else: print(f"📂 Validation Set: Found {len(self.files)} samples.")
-        
-        self.transform = transforms.Compose([
-            transforms.CenterCrop(512), # 验证时中心裁剪，保证尺寸统一
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3)
-        ])
+def scan_latent_schema(root_dir: str, n: int = 50):
+    paths = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
+    assert len(paths) > 0, "No train latents found."
+    n = min(n, len(paths))
+    for p in paths[:n]:
+        d = torch.load(p, map_location="cpu")
+        if "hr_latent" not in d or "lr_latent" not in d:
+            raise KeyError(f"Bad schema in {p}, keys={list(d.keys())}")
+        hr = d["hr_latent"]; lr = d["lr_latent"]
+        if hr.ndim != 3 or lr.ndim != 3:
+            raise ValueError(f"Bad shape in {p}: hr={hr.shape}, lr={lr.shape}")
+        if hr.shape != (4,64,64) or lr.shape != (4,64,64):
+            raise ValueError(f"Unexpected shape in {p}: hr={hr.shape}, lr={lr.shape}")
+    print(f"✅ [SCAN] Train latent schema ok: {n}/{n} checked.")
 
-    def __len__(self): return len(self.files)
+# -------------------------
+# 5) 验证：从 HR 图像生成 LR，再 VAE encode 得到 lr_latent/hr_latent
+# -------------------------
+def pil_to_tensor_norm01(pil: Image.Image) -> torch.Tensor:
+    # $$ [MOD-IMG-1] 用 numpy 转换，避免 TypedStorage 警告；结果是 [3,H,W] float32 in [0,1]
+    arr = np.asarray(pil, dtype=np.uint8)  # [H,W,3]
+    x = torch.from_numpy(arr).permute(2,0,1).float() / 255.0
+    return x
+
+def norm01_to_norm11(x01: torch.Tensor) -> torch.Tensor:
+    return x01 * 2.0 - 1.0
+
+def transforms_to_pil(x01: torch.Tensor) -> Image.Image:
+    x = (x01.clamp(0,1) * 255.0).byte().permute(1,2,0).cpu().numpy()
+    return Image.fromarray(x)
+
+def _jpeg_compress_tensor(x11: torch.Tensor, quality: int) -> torch.Tensor:
+    x = x11.clamp(-1,1)
+    x01 = (x + 1.0) / 2.0
+    x01 = x01.cpu()
+    pil = transforms_to_pil(x01)
+    buffer = io.BytesIO()
+    pil.save(buffer, format="JPEG", quality=int(quality))
+    buffer.seek(0)
+    pil2 = Image.open(buffer).convert("RGB")
+    x01b = pil_to_tensor_norm01(pil2)
+    return norm01_to_norm11(x01b)
+
+def center_crop(pil: Image.Image, size: int = 512) -> Image.Image:
+    w, h = pil.size
+    if w < size or h < size:
+        pil = pil.resize((max(size, w), max(size, h)), resample=Image.BICUBIC)
+        w, h = pil.size
+    left = (w - size) // 2
+    top  = (h - size) // 2
+    return pil.crop((left, top, left + size, top + size))
+
+def gaussian_kernel2d(k: int, sigma: float, device, dtype):
+    ax = torch.arange(k, device=device, dtype=dtype) - (k - 1) / 2.0
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel = kernel / kernel.sum()
+    return kernel
+
+def depthwise_conv2d(x: torch.Tensor, kernel2d: torch.Tensor) -> torch.Tensor:
+    k = kernel2d.shape[0]
+    w = kernel2d.view(1,1,k,k).repeat(3,1,1,1)
+    return F.conv2d(x, w, padding=k//2, groups=3)
+
+def degrade_hr_to_lr_tensor(
+    hr11: torch.Tensor,
+    mode: str,
+    rng: random.Random,
+    torch_gen: Optional[torch.Generator] = None,  # $$ [MOD-SEED-2] 用 generator 固定 torch 随机噪声
+) -> torch.Tensor:
+    """
+    hr11: [3,512,512] in [-1,1] (cpu)
+    return lr11: [3,512,512] in [-1,1] (cpu)
+    """
+    if mode == "bicubic":
+        hr = hr11.unsqueeze(0)
+        lr_small = F.interpolate(hr, scale_factor=0.25, mode="bicubic", align_corners=False)
+        lr = F.interpolate(lr_small, size=(512,512), mode="bicubic", align_corners=False)
+        return lr.squeeze(0)
+
+    blur_k = rng.choice([3,5,7])
+    blur_sigma = rng.uniform(0.2, 1.2)
+
+    hr = hr11.unsqueeze(0)
+    kernel = gaussian_kernel2d(blur_k, blur_sigma, device=hr.device, dtype=hr.dtype)
+    hr_blur = depthwise_conv2d(hr, kernel)
+
+    lr_small = F.interpolate(hr_blur, scale_factor=0.25, mode="bicubic", align_corners=False)
+
+    noise_std = rng.uniform(0.0, 0.02)
+    if noise_std > 0:
+        # $$ [MOD-SEED-2] 用 torch_gen 采样噪声，保证每张图的退化可复现（否则每天都会抖）
+        if torch_gen is None:
+            eps = torch.randn(lr_small.shape, device=lr_small.device, dtype=lr_small.dtype)
+        else:
+            eps = torch.randn(lr_small.shape, generator=torch_gen, device=lr_small.device, dtype=lr_small.dtype)
+        lr_small = (lr_small + eps * noise_std).clamp(-1,1)
+
+    jpeg_q = rng.randint(30, 95)
+    lr_small_cpu = lr_small.squeeze(0).cpu()
+    lr_small_cpu = _jpeg_compress_tensor(lr_small_cpu, jpeg_q).unsqueeze(0)
+
+    lr = F.interpolate(lr_small_cpu, size=(512,512), mode="bicubic", align_corners=False)
+    return lr.squeeze(0)
+
+class ValImageDataset(Dataset):
+    def __init__(self, hr_dir: str, max_files: Optional[int] = None):
+        exts = ["*.png","*.jpg","*.jpeg","*.PNG","*.JPG"]
+        paths = []
+        for e in exts:
+            paths += glob.glob(os.path.join(hr_dir, e))
+        self.paths = sorted(list(set(paths)))
+        if max_files is not None:
+            self.paths = self.paths[:max_files]
+        if len(self.paths) == 0:
+            raise FileNotFoundError(f"No HR images found in: {hr_dir}")
+
+    def __len__(self):
+        return len(self.paths)
+
     def __getitem__(self, idx):
-        img_path = self.files[idx]
-        hr_img = Image.open(img_path).convert("RGB")
-        hr_tensor = self.transform(hr_img)
-        
-        # 模拟退化：Downsample -> Upsample
-        lr_small = F.interpolate(hr_tensor.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
-        lr_tensor = F.interpolate(lr_small, size=(512, 512), mode='bicubic', align_corners=False).squeeze(0)
-        
-        return {
-            'hr_img': hr_tensor, # [-1, 1]
-            'lr_img': lr_tensor, # [-1, 1]
-            'name': os.path.basename(img_path)
-        }
+        p = self.paths[idx]
+        pil = Image.open(p).convert("RGB")
+        pil = center_crop(pil, 512)
+        hr01 = pil_to_tensor_norm01(pil)
+        hr11 = norm01_to_norm11(hr01)
+        return {"hr_img_11": hr11, "path": p}
 
-# ==============================================================================
-# 主训练流程
-# ==============================================================================
-def train_full_production():
-    print(f"\n🚀 Start Full Training Production Run")
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(VIS_DIR, exist_ok=True)
-    
-    # --- 1. Init Models ---
-    print("   Loading PixArt...")
-    pixart = PixArtMS_XL_2(input_size=64).to(DEVICE).to(DTYPE).train()
-    if os.path.exists(PIXART_PATH):
-        ckpt = torch.load(PIXART_PATH, map_location="cpu")
-        if "state_dict" in ckpt: ckpt = ckpt["state_dict"]
-        if "pos_embed" in ckpt: del ckpt["pos_embed"]
-        pixart.load_state_dict(ckpt, strict=False)
-    
-    # 开启梯度检查点省显存
-    if hasattr(pixart, 'enable_gradient_checkpointing'): pixart.enable_gradient_checkpointing()
-    else: pixart.gradient_checkpointing = True 
-    
-    print("   Loading Adapter...")
-    adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()
-    
-    # --- 2. Freeze & FP32 ---
-    for p in pixart.parameters(): p.requires_grad = False
-    
-    # 强制可训练参数为 FP32 (AMP 要求)
-    pixart.injection_scales = pixart.injection_scales.to(torch.float32)
-    pixart.adapter_proj = pixart.adapter_proj.to(torch.float32)
-    pixart.adapter_norm = pixart.adapter_norm.to(torch.float32)
-    pixart.cross_attn_scale.data = pixart.cross_attn_scale.data.float()
-    if hasattr(pixart, 'input_adapter_ln'):
+# -------------------------
+# 6) 只训练 A：Adapter + (PixArt 注入相关小模块)
+# -------------------------
+def set_trainable_A(pixart, adapter):
+    for p in pixart.parameters():
+        p.requires_grad = False
+
+    # 训练的注入相关模块全部 FP32（否则 GradScaler 会报 “unscale FP16 gradients”）
+    if hasattr(pixart, "injection_scales"):
+        for s in pixart.injection_scales:
+            s.data = s.data.float()
+    if hasattr(pixart, "adapter_proj"):
+        pixart.adapter_proj = pixart.adapter_proj.to(torch.float32)
+    if hasattr(pixart, "adapter_norm"):
+        pixart.adapter_norm = pixart.adapter_norm.to(torch.float32)
+    if hasattr(pixart, "cross_attn_scale"):
+        pixart.cross_attn_scale.data = pixart.cross_attn_scale.data.float()
+    if hasattr(pixart, "input_adapter_ln"):
         pixart.input_adapter_ln = pixart.input_adapter_ln.to(torch.float32)
 
-    # --- 3. Optimizer ---
-    adapter_params = list(adapter.parameters())
     scale_params = []
-    for scale in pixart.injection_scales: scale.requires_grad = True; scale_params.append(scale)
-    pixart.cross_attn_scale.requires_grad = True; scale_params.append(pixart.cross_attn_scale)
-    
+    for s in pixart.injection_scales:
+        s.requires_grad = True
+        scale_params.append(s)
+
+    pixart.cross_attn_scale.requires_grad = True
+    scale_params.append(pixart.cross_attn_scale)
+
     proj_params = []
-    for p in pixart.adapter_proj.parameters(): p.requires_grad = True; proj_params.append(p)
-    for p in pixart.adapter_norm.parameters(): p.requires_grad = True; proj_params.append(p)
-    if hasattr(pixart, 'input_adapter_ln'):
-        for p in pixart.input_adapter_ln.parameters(): p.requires_grad = True; proj_params.append(p)
+    for p in pixart.adapter_proj.parameters():
+        p.requires_grad = True
+        proj_params.append(p)
+    for p in pixart.adapter_norm.parameters():
+        p.requires_grad = True
+        proj_params.append(p)
+    if hasattr(pixart, "input_adapter_ln"):
+        for p in pixart.input_adapter_ln.parameters():
+            p.requires_grad = True
+            proj_params.append(p)
+
+    adapter_params = list(adapter.parameters())
+
+    for pp in (adapter_params + proj_params + scale_params):
+        if pp.dtype != torch.float32:
+            raise ValueError(f"Trainable param is not fp32: dtype={pp.dtype}")
+
+    print(f"🔥 Trainable: Adapter({sum(p.numel() for p in adapter_params)}) | "
+          f"Proj/LN({len(proj_params)}) | Scales({len(scale_params)})")
 
     optimizer = torch.optim.AdamW([
-        {'params': adapter_params, 'lr': LR_ADAPTER},
-        {'params': proj_params, 'lr': LR_ADAPTER},
-        {'params': scale_params, 'lr': LR_SCALES}
+        {"params": adapter_params, "lr": LR_ADAPTER},
+        {"params": proj_params,    "lr": LR_ADAPTER},
+        {"params": scale_params,   "lr": LR_SCALES},
     ])
-    
-    scaler = GradScaler()
+    return optimizer
+
+def build_text_cond():
+    y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1)
+    y_embed = y_embed.to(DEVICE).to(DTYPE_PIXART)
+    data_info = {
+        "img_hw": torch.tensor([[512.,512.]], device=DEVICE, dtype=DTYPE_PIXART),
+        "aspect_ratio": torch.tensor([1.], device=DEVICE, dtype=DTYPE_PIXART),
+    }
+    return y_embed, data_info
+
+# -------------------------
+# $$ [MOD-SEED-3] 稳定哈希：跨进程/跨天/跨机器一致（不会被 Python hash 随机化影响）
+# -------------------------
+def stable_int_hash(s: str, mod: int = 2**32) -> int:
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()
+    return int(h, 16) % mod
+
+# -------------------------
+# $$ [MOD-METRIC-3] RGB->Y：按 SR 常用的 YCbCr(BT.601) 亮度定义（浮点 0..1）
+#   y = (16 + 65.481 R + 128.553 G + 24.966 B) / 255
+# -------------------------
+def rgb01_to_y01(rgb01: torch.Tensor) -> torch.Tensor:
+    # rgb01: [1,3,H,W] in [0,1]
+    r = rgb01[:, 0:1]
+    g = rgb01[:, 1:2]
+    b = rgb01[:, 2:3]
+    y = (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
+    return y.clamp(0.0, 1.0)
+
+def shave_border(x: torch.Tensor, shave: int) -> torch.Tensor:
+    if shave <= 0:
+        return x
+    return x[..., shave:-shave, shave:-shave]
+
+# -------------------------
+# 7) 验证：沿用你单样本的 “SDE_STRENGTH + DPMSolver” 逻辑
+# -------------------------
+@torch.no_grad()
+def validate_epoch(
+    epoch: int,
+    pixart,
+    adapter,
+    vae,
+    val_loader,
+    y_embed,
+    data_info,
+    lpips_fn=None,
+    max_vis: int = 1,
+):
+    pixart.eval()
+    adapter.eval()
+
+    psnr_list, ssim_list, lpips_list = [], [], []
+    vis_done = 0
+
+    pbar = tqdm(val_loader, desc=f"Valid Ep{epoch+1}", dynamic_ncols=True)
+    for it, batch in enumerate(pbar):
+        hr_img_11 = batch["hr_img_11"].to(DEVICE).float()  # [B,3,512,512]
+        B = hr_img_11.shape[0]
+
+        for bi in range(B):
+            item_hr = hr_img_11[bi:bi+1]
+            path = batch["path"][bi]
+
+            # $$ [MOD-SEED-4] 每张图：stable hash -> 固定退化超参 + 固定退化噪声
+            seed_i = (stable_int_hash(path) + 12345) & 0xFFFFFFFF
+            rng = random.Random(seed_i)
+            torch_gen = torch.Generator(device="cpu").manual_seed(seed_i)
+
+            # 退化得到 LR（在 CPU 做，保证 PIL/JPEG 兼容且稳定）
+            lr_img_11 = degrade_hr_to_lr_tensor(
+                item_hr.squeeze(0).detach().cpu(),
+                VAL_DEGRADE_MODE,
+                rng,
+                torch_gen=torch_gen,  # $$ [MOD-SEED-2]
+            ).unsqueeze(0)
+
+            lr_img_11 = lr_img_11.to(DEVICE).float()
+
+            # VAE encode（不需要梯度）
+            hr_latent = vae.encode(item_hr).latent_dist.sample() * vae.config.scaling_factor   # [1,4,64,64] fp32
+            lr_latent = vae.encode(lr_img_11).latent_dist.sample() * vae.config.scaling_factor # [1,4,64,64] fp32
+
+            # 采样：严格对齐你单样本脚本的写法
+            scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
+            scheduler.set_timesteps(NUM_INFER_STEPS, device=DEVICE)
+
+            start_t_val = int(1000 * SDE_STRENGTH)
+            # 这里保持“过滤 timesteps”的方式（与你单样本一致）
+            run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
+
+            g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
+            latents = lr_latent.to(DEVICE)  # fp32
+            noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
+            t_start = torch.tensor([start_t_val], device=DEVICE).long()
+            latents = scheduler.add_noise(latents, noise, t_start)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                cond = adapter(lr_latent.float())  # fp32 list
+
+            for t in run_ts:
+                t_tensor = t.unsqueeze(0).to(DEVICE)
+                with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
+                    out = pixart(
+                        latents.to(DTYPE_PIXART),
+                        t_tensor,
+                        y_embed,
+                        data_info=data_info,
+                        adapter_cond=cond,
+                        injection_mode="hybrid",
+                    )
+                    if out.shape[1] == 8:
+                        out, _ = out.chunk(2, dim=1)
+
+                latents = scheduler.step(out.float(), t, latents.float()).prev_sample
+
+            pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+            pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+
+            gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
+            gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
+
+            lr_img_01 = torch.clamp((lr_img_11 + 1.0) / 2.0, 0.0, 1.0)
+
+            if USE_METRICS:
+                # $$ [MOD-METRIC-4] PSNR/SSIM 在 Y 通道算（并可按 SR 习惯 shave border）
+                if METRIC_Y_CHANNEL:
+                    pred_y = rgb01_to_y01(pred_img_01)
+                    gt_y   = rgb01_to_y01(gt_img_01)
+                    pred_y = shave_border(pred_y, METRIC_SHAVE_BORDER)
+                    gt_y   = shave_border(gt_y, METRIC_SHAVE_BORDER)
+                    p = psnr(pred_y, gt_y, data_range=1.0).item()
+                    s = ssim(pred_y, gt_y, data_range=1.0).item()
+                else:
+                    p = psnr(pred_img_01, gt_img_01, data_range=1.0).item()
+                    s = ssim(pred_img_01, gt_img_01, data_range=1.0).item()
+
+                psnr_list.append(p)
+                ssim_list.append(s)
+
+                if lpips_fn is not None:
+                    pred_norm = pred_img_01 * 2.0 - 1.0
+                    gt_norm   = gt_img_01 * 2.0 - 1.0
+                    l = lpips_fn(pred_norm, gt_norm).item()
+                    lpips_list.append(l)
+
+            if vis_done < max_vis:
+                save_path = os.path.join(VIS_DIR, f"epoch{epoch+1:03d}_it{it:04d}.png")
+                lr_np = lr_img_01[0].permute(1,2,0).detach().cpu().numpy()
+                gt_np = gt_img_01[0].permute(1,2,0).detach().cpu().numpy()
+                pr_np = pred_img_01[0].permute(1,2,0).detach().cpu().numpy()
+
+                plt.figure(figsize=(12,4))
+                plt.subplot(1,3,1); plt.imshow(lr_np); plt.title("LR"); plt.axis("off")
+                plt.subplot(1,3,2); plt.imshow(gt_np); plt.title("GT"); plt.axis("off")
+                plt.subplot(1,3,3); plt.imshow(pr_np); plt.title("Pred"); plt.axis("off")
+                plt.tight_layout()
+                plt.savefig(save_path, bbox_inches="tight")
+                plt.close()
+                vis_done += 1
+
+        if USE_METRICS and len(psnr_list) > 0:
+            pbar.set_postfix({
+                "PSNR": f"{sum(psnr_list)/len(psnr_list):.2f}",
+                "SSIM": f"{sum(ssim_list)/len(ssim_list):.4f}",
+                "LPIPS": f"{(sum(lpips_list)/len(lpips_list)):.4f}" if len(lpips_list)>0 else "NA"
+            })
+
+    avg_psnr = sum(psnr_list)/len(psnr_list) if len(psnr_list)>0 else float("nan")
+    avg_ssim = sum(ssim_list)/len(ssim_list) if len(ssim_list)>0 else float("nan")
+    avg_lp   = sum(lpips_list)/len(lpips_list) if len(lpips_list)>0 else float("nan")
+    return avg_psnr, avg_ssim, avg_lp
+
+def extract_inject_state_dict(pixart) -> Dict[str, torch.Tensor]:
+    sd = pixart.state_dict()
+    keep = {}
+    for k,v in sd.items():
+        if (
+            k.startswith("injection_scales")
+            or k.startswith("adapter_proj")
+            or k.startswith("adapter_norm")
+            or k.startswith("cross_attn_scale")
+            or k.startswith("input_adapter_ln")
+        ):
+            keep[k] = v.detach().cpu()
+    return keep
+
+def load_inject_state_dict(pixart, inject_sd: Dict[str, torch.Tensor]):
+    # 部分加载：把 inject_sd 覆盖进 pixart 的 state_dict，再 strict=False load
+    sd = pixart.state_dict()
+    for k, v in inject_sd.items():
+        if k in sd:
+            sd[k] = v.to(sd[k].dtype)
+    pixart.load_state_dict(sd, strict=False)
+
+def should_keep_ckpt(psnr_v: float, lpips_v: float) -> Tuple[int, float]:
+    if not math.isfinite(psnr_v):
+        return (999, float("inf"))
+    if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v):
+        return (0, lpips_v)
+    return (1, -psnr_v)
+
+# $$ [MOD-RESUME-1] 保存“全状态 last checkpoint”，用于无歧义续跑（包含 optimizer/scaler/rng）
+def save_last_full_state(
+    epoch: int,
+    global_step: int,
+    pixart,
+    adapter,
+    optimizer,
+    scaler,
+    best_records: List[dict],
+):
+    payload = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "adapter": adapter.state_dict(),
+        "pixart_inject": extract_inject_state_dict(pixart),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict() if (scaler is not None) else None,
+        "best_records": best_records,
+        # RNG states for strict reproducibility
+        "py_random_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    torch.save(payload, LAST_CKPT_PATH)
+
+def save_topk_checkpoints(epoch: int, pixart, adapter, metrics: Tuple[float,float,float], records: List[dict]):
+    psnr_v, ssim_v, lp_v = metrics
+    pr, score = should_keep_ckpt(psnr_v, lp_v)
+
+    records = [r for r in records if r["epoch"] >= epoch - (KEEP_LAST_EPOCHS - 1)]
+
+    ckpt_name = f"epoch{epoch+1:03d}_psnr{psnr_v:.2f}_lp{lp_v if math.isfinite(lp_v) else 999:.4f}.pth"
+    ckpt_path = os.path.join(CKPT_DIR, ckpt_name)
+
+    payload = {
+        "epoch": epoch,
+        "psnr": psnr_v,
+        "ssim": ssim_v,
+        "lpips": lp_v,
+        "adapter": adapter.state_dict(),
+        "pixart_inject": extract_inject_state_dict(pixart),
+        # 注意：这个 topK ckpt 仍然只做“展示/对比”用途；真正续跑用 LAST_CKPT_PATH
+    }
+    torch.save(payload, ckpt_path)
+
+    records.append({
+        "epoch": epoch,
+        "path": ckpt_path,
+        "priority": pr,
+        "score": score,
+        "psnr": psnr_v,
+        "lpips": lp_v,
+    })
+
+    records = sorted(records, key=lambda r: (r["priority"], r["score"]))[:KEEP_TOPK]
+
+    keep_paths = set(r["path"] for r in records)
+    for f in glob.glob(os.path.join(CKPT_DIR, "epoch*.pth")):
+        if f not in keep_paths:
+            try:
+                os.remove(f)
+            except:
+                pass
+
+    return records
+
+# $$ [MOD-RESUME-2] resume 加载：优先支持“last_full_state.pth”；也兼容你现有的 epoch003_*.pth（只恢复权重）
+def try_resume(
+    resume_path: str,
+    pixart,
+    adapter,
+    optimizer,
+    scaler,
+):
+    ckpt = torch.load(resume_path, map_location="cpu")
+
+    if "adapter" in ckpt:
+        adapter.load_state_dict(ckpt["adapter"], strict=True)
+    else:
+        raise KeyError("Resume ckpt missing key: adapter")
+
+    if "pixart_inject" in ckpt:
+        load_inject_state_dict(pixart, ckpt["pixart_inject"])
+    else:
+        print("⚠️ Resume ckpt has no pixart_inject (unexpected). Continue without it.")
+
+    start_epoch = int(ckpt.get("epoch", -1)) + 1
+    global_step = int(ckpt.get("global_step", 0))
+    best_records = ckpt.get("best_records", [])
+
+    # 旧格式 epoch003_*.pth：没有 optimizer/scaler/rng，必须重置
+    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as e:
+            print(f"⚠️ Optimizer state load failed, will reset. err={e}")
+
+    if scaler is not None and "scaler" in ckpt and ckpt["scaler"] is not None:
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception as e:
+            print(f"⚠️ Scaler state load failed, will reset. err={e}")
+
+    if "py_random_state" in ckpt:
+        try:
+            random.setstate(ckpt["py_random_state"])
+        except Exception:
+            pass
+    if "torch_rng_state" in ckpt:
+        try:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+        except Exception:
+            pass
+    if torch.cuda.is_available() and ("cuda_rng_state_all" in ckpt) and (ckpt["cuda_rng_state_all"] is not None):
+        try:
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state_all"])
+        except Exception:
+            pass
+
+    print(f"✅ [RESUME] loaded: {resume_path}")
+    print(f"    start_epoch={start_epoch} | global_step={global_step} | best_records={len(best_records)}")
+    return start_epoch, global_step, best_records
+
+# -------------------------
+# 8) 主训练
+# -------------------------
+def main():
+    global SMOKE
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
+    parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
+    args = parser.parse_args()
+    SMOKE = bool(args.smoke)
+
+    print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
+    scan_latent_schema(TRAIN_LATENT_DIR, n=50)
+
+    train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
+    val_max   = SMOKE_VAL_SAMPLES if SMOKE else None
+
+    train_ds = TrainLatentDataset(TRAIN_LATENT_DIR, max_files=train_max)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=(DEVICE=="cuda"),
+        drop_last=True
+    )
+
+    val_ds = ValImageDataset(VAL_HR_DIR, max_files=val_max)
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=0, pin_memory=(DEVICE=="cuda")
+    )
+
+    print("Loading PixArt...")
+    pixart = PixArtMS_XL_2(input_size=64).to(DEVICE).to(DTYPE_PIXART).train()
+    ckpt = torch.load(PIXART_PATH, map_location="cpu")
+    if "state_dict" in ckpt: ckpt = ckpt["state_dict"]
+    if "pos_embed" in ckpt: del ckpt["pos_embed"]
+    pixart.load_state_dict(ckpt, strict=False)
+
+    print("Loading Adapter...")
+    adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
+
+    optimizer = set_trainable_A(pixart, adapter)
+    scaler = GradScaler(enabled=USE_AMP)
+
     diffusion = IDDPM(str(1000))
 
-    # --- 4. Data Loaders ---
-    train_loader = DataLoader(
-        TrainLatentDataset(TRAIN_DATASET_DIR), 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=NUM_WORKERS,
-        pin_memory=True
-    )
-    
-    # 验证集 BS=1
-    valid_loader = DataLoader(
-        ValidImageDataset(VALID_DATASET_DIR), 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=1
-    )
+    vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
+    vae.enable_slicing()
 
-    print("   Loading VAE (for encoding)...")
-    vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).to(DTYPE)
-    vae.eval()
-    for p in vae.parameters(): p.requires_grad = False
+    y_embed, data_info = build_text_cond()
 
-    y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE).to(DTYPE)
-    data_info = {'img_hw': torch.tensor([[512., 512.]]).to(DEVICE).to(DTYPE), 'aspect_ratio': torch.tensor([1.]).to(DEVICE).to(DTYPE)}
+    lpips_fn = None
+    if USE_METRICS:
+        lpips_fn = lpips.LPIPS(net="vgg").to(DEVICE).eval()
+        for p in lpips_fn.parameters():
+            p.requires_grad = False
 
-    # --- Helpers ---
-    def predict_x0(x_t, eps, t):
-        acp = torch.from_numpy(diffusion.alphas_cumprod).to(x_t.device).to(x_t.dtype)
-        at = acp[t]
-        return (x_t - (1 - at).sqrt().view(-1, 1, 1, 1) * eps) / at.sqrt().view(-1, 1, 1, 1)
+    best_records = []
+    global_step = 0
+    start_epoch = 0
 
-    def latent_texture_loss(pred, target):
-        p_dx = pred[..., 1:] - pred[..., :-1]; p_dy = pred[..., 1:, :] - pred[..., :-1, :]
-        t_dx = target[..., 1:] - target[..., :-1]; t_dy = target[..., 1:, :] - target[..., :-1, :]
-        return F.l1_loss(p_dx, t_dx) + F.l1_loss(p_dy, t_dy)
+    # $$ [MOD-RESUME-3] resume 支持：可从 epoch003_*.pth 继续（至少恢复权重）
+    if args.resume is not None:
+        start_epoch, global_step, best_records = try_resume(
+            args.resume, pixart, adapter, optimizer, scaler
+        )
 
-    # -------------------------------------------------------------------------
-    # 5. Training Loop
-    # -------------------------------------------------------------------------
-    for epoch in range(NUM_EPOCHS):
-        print(f"\n🌟 Epoch {epoch+1}/{NUM_EPOCHS}")
-        
+    # 训练
+    total_epochs = (EPOCHS if not SMOKE else 1)
+    for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
-        
-        pbar = tqdm(train_loader, desc="Training")
-        optimizer.zero_grad()
-        
-        for i, batch in enumerate(pbar):
-            # Data
-            hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE)
-            lr_img = batch["lr_img"].to(DEVICE).to(DTYPE)
-            
-            # Encode LR (On-the-fly)
-            with torch.no_grad():
-                dist = vae.encode(lr_img).latent_dist
-                lr_latent = dist.sample() * vae.config.scaling_factor
-            
-            # Noise
-            current_bs = hr_latent.shape[0]
-            t = torch.randint(0, 1000, (current_bs,), device=DEVICE).long()
+        pbar = tqdm(train_loader, desc=f"Train Ep{epoch+1}", dynamic_ncols=True)
+
+        for batch in pbar:
+            hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
+            lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
+
+            B = hr_latent.shape[0]
+            t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             noise = torch.randn_like(hr_latent)
-            noisy_input = diffusion.q_sample(hr_latent, t, noise)
-            
-            batch_y_embed = y_embed.repeat(current_bs, 1, 1, 1)
-            batch_data_info = {k: v.repeat(current_bs, 1) for k, v in data_info.items()}
-            
-            # Forward
-            adapter_cond = adapter(lr_latent.float())
-            
-            with torch.cuda.amp.autocast():
-                model_out = pixart(
-                    noisy_input, t, batch_y_embed, 
-                    data_info=batch_data_info, 
-                    adapter_cond=adapter_cond, 
-                    injection_mode='hybrid'
+            noisy = diffusion.q_sample(hr_latent, t, noise)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                cond = adapter(lr_latent.float())
+
+            with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
+                out = pixart(
+                    noisy.to(DTYPE_PIXART),
+                    t,
+                    y_embed,
+                    data_info=data_info,
+                    adapter_cond=cond,
+                    injection_mode="hybrid",
                 )
-                if model_out.shape[1] == 8: model_out, _ = model_out.chunk(2, dim=1)
-                
-                # Loss Calculation
-                loss_mse = F.mse_loss(model_out, noise)
-                
-                # Texture Loss (Low VRAM alternative to LPIPS)
-                pred_x0 = predict_x0(noisy_input.float(), model_out.float(), t)
-                loss_tex = latent_texture_loss(pred_x0, hr_latent.float())
-                
-                loss = loss_mse + TEXTURE_LOSS_WEIGHT * loss_tex
-                
-                # Gradient Accumulation
-                loss = loss / GRAD_ACCUM_STEPS
-            
-            scaler.scale(loss).backward()
-            
-            if (i + 1) % GRAD_ACCUM_STEPS == 0:
+                if out.shape[1] == 8:
+                    out, _ = out.chunk(2, dim=1)
+                loss = F.mse_loss(out.float(), noise.float())
+
+            if USE_AMP:
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
-            
-            # Logging
-            if isinstance(adapter_cond, list):
-                adapter_abs_mean = np.mean([f.abs().mean().item() for f in adapter_cond])
             else:
-                adapter_abs_mean = adapter_cond.abs().mean().item()
-            pbar.set_postfix({"Loss": f"{loss.item() * GRAD_ACCUM_STEPS:.5f}", "Adp": f"{adapter_abs_mean:.5f}"})
+                loss.backward()
+                optimizer.step()
 
-        # --- Validation & Save ---
-        if (epoch + 1) % SAVE_INTERVAL_EPOCH == 0:
-            # 1. Save
-            save_checkpoint(epoch, adapter, pixart, optimizer, scaler)
-            
-            # 2. Validate
-            print(f"   🔍 Running Full Validation...")
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            run_production_validation(epoch, pixart, adapter, vae, valid_loader, y_embed, data_info)
+            global_step += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
 
-def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, data_info):
-    model.eval()
-    adapter.eval()
-    
-    # [核心修正] 1. 手动实例化 Scheduler，避免从文件加载配置出错
-    scheduler = DPMSolverMultistepScheduler(
-        num_train_timesteps=1000,
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
-        solver_order=2
-    )
-    
-    start_t = int(1000 * SDE_STRENGTH)
-    
-    total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
-    count = 0
-    
-    with torch.no_grad():
-        for idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
-            # [核心修正] 2. 每次处理图片前重置 Timesteps，清除 DPM 历史状态
-            scheduler.set_timesteps(20)
-            timesteps = [t for t in scheduler.timesteps if t <= start_t]
-            t_start_tensor = torch.tensor([start_t], device=DEVICE).long()
+        # 验证
+        vpsnr, vssim, vlp = validate_epoch(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn, max_vis=1)
+        print(f"[VAL] epoch={epoch+1} PSNR={vpsnr:.2f} SSIM={vssim:.4f} LPIPS={vlp if math.isfinite(vlp) else float('nan'):.4f}")
 
-            hr_img = batch['hr_img'].to(DEVICE).to(DTYPE)
-            lr_img = batch['lr_img'].to(DEVICE).to(DTYPE)
-            
-            # Encode
-            dist = vae.encode(lr_img).latent_dist
-            lr_latent = dist.sample() * vae.config.scaling_factor
-            
-            # Noise
-            g = torch.Generator(DEVICE).manual_seed(42 + idx)
-            latents = lr_latent.clone()
-            noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
-            latents = scheduler.add_noise(latents, noise, t_start_tensor)
-            
-            # Inference
-            cond = adapter(lr_latent.float())
-            for t in timesteps:
-                t_tensor = t.unsqueeze(0).to(DEVICE)
-                with torch.cuda.amp.autocast():
-                    out = model(latents, t_tensor, y_embed, data_info=data_info, adapter_cond=cond, injection_mode='hybrid')
-                if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
-                latents = scheduler.step(out, t, latents).prev_sample
-            
-            # Decode & Metrics
-            if USE_METRICS or idx == 0:
-                pred_img = vae.decode(latents / vae.config.scaling_factor).sample
-                pred_img = torch.clamp(pred_img, -1.0, 1.0)
-                
-                if USE_METRICS:
-                    p_01 = (pred_img.float() / 2 + 0.5).clamp(0, 1)
-                    g_01 = (hr_img.float() / 2 + 0.5).clamp(0, 1)
-                    total_psnr += psnr(p_01, g_01, data_range=1.0).item()
-                    total_ssim += ssim(p_01, g_01, data_range=1.0).item()
-                    total_lpips += val_lpips_fn(pred_img, hr_img).item()
-                
-                # Save First Image
-                if idx == 0:
-                    pred_np = (pred_img[0].permute(1, 2, 0).detach().cpu().float().numpy() / 2 + 0.5).clip(0, 1)
-                    lr_np = ((lr_img[0].cpu().permute(1, 2, 0).float().numpy() + 1) / 2).clip(0, 1)
-                    plt.figure(figsize=(10, 5))
-                    plt.subplot(1, 2, 1); plt.imshow(lr_np); plt.title("Input LR")
-                    plt.subplot(1, 2, 2); plt.imshow(pred_np); plt.title(f"Ep {epoch+1}")
-                    plt.axis('off')
-                    plt.savefig(f"{VIS_DIR}/ep{epoch+1:04d}_sample.png", bbox_inches='tight')
-                    plt.close()
-            
-            count += 1
+        # $$ [MOD-RESUME-4] 每个 epoch 保存一份 last_full_state：保证你随时能“精确续跑”
+        save_last_full_state(epoch, global_step, pixart, adapter, optimizer, scaler, best_records)
 
-    # Log Average
-    if count > 0:
-        print(f"   📊 Val Results (Ep {epoch+1}): PSNR={total_psnr/count:.2f}, SSIM={total_ssim/count:.4f}, LPIPS={total_lpips/count:.4f}")
-        with open(os.path.join(CHECKPOINT_DIR, "val_metrics.txt"), "a") as f:
-            f.write(f"Epoch {epoch+1}: PSNR={total_psnr/count:.4f}, SSIM={total_ssim/count:.4f}, LPIPS={total_lpips/count:.4f}\n")
+        # topK（最近3个epoch内）
+        best_records = save_topk_checkpoints(epoch, pixart, adapter, (vpsnr, vssim, vlp), best_records)
 
-def save_checkpoint(epoch, adapter, pixart, optimizer, scaler):
-    save_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch+1:04d}.pth")
-    pixart_trainable = {
-        'injection_scales': pixart.injection_scales.state_dict(),
-        'adapter_proj': pixart.adapter_proj.state_dict(),
-        'adapter_norm': pixart.adapter_norm.state_dict(),
-        'cross_attn_scale': pixart.cross_attn_scale,
-    }
-    if hasattr(pixart, 'input_adapter_ln'):
-        pixart_trainable['input_adapter_ln'] = pixart.input_adapter_ln.state_dict()
+    print("✅ Done. Kept checkpoints (topK within last epochs):")
+    for r in best_records:
+        print(f"  epoch={r['epoch']+1} psnr={r['psnr']:.2f} lpips={r['lpips'] if math.isfinite(r['lpips']) else float('nan'):.4f} file={os.path.basename(r['path'])}")
 
-    torch.save({
-        'epoch': epoch,
-        'adapter_state_dict': adapter.state_dict(),
-        'pixart_trainable': pixart_trainable,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scaler_state_dict': scaler.state_dict(),
-    }, save_path)
+    print(f"✅ Resume checkpoint (full state) saved at: {LAST_CKPT_PATH}")
 
 if __name__ == "__main__":
-    train_full_production()
+    main()

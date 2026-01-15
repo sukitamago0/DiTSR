@@ -264,7 +264,7 @@
 #     return PixArtMS(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 ##————————————————————————————
-# v2****最好版本
+# v2****最好版本 pixartMS.py
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath
@@ -419,13 +419,15 @@ class PixArtMS(PixArt):
                     # Flatten: [B, C, H, W] -> [B, N, C]
                     feat_flat = feat.flatten(2).transpose(1, 2)
                     # Apply LN (保留成功经验)
-                    feat_flat = self.input_adapter_ln(feat_flat)
+                    with torch.cuda.amp.autocast(enabled=False):
+                        feat_flat = self.input_adapter_ln(feat_flat.float())
                     adapter_features.append(feat_flat)
             
             # 2. 如果是 Tensor (Single-Scale Adapter 输出，兼容旧代码)
             else:
                 feat_flat = adapter_cond.flatten(2).transpose(1, 2)
-                feat_flat = self.input_adapter_ln(feat_flat)
+                with torch.cuda.amp.autocast(enabled=False):
+                    feat_flat = self.input_adapter_ln(feat_flat.float())
                 # 复制 4 份，填满 injection_layers
                 adapter_features = [feat_flat] * len(self.injection_layers)
 
