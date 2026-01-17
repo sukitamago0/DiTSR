@@ -167,6 +167,9 @@ docker/cache/huggingface
 # ===== Dataset & Outputs (DO NOT TRACK) =====
 dataset/
 output/
+!dataset/.gitkeep
+!dataset/DIV2K_train_HR/.gitkeep
+!dataset/DIV2K_train_latents/.gitkeep
 
 # ===== Experiment results / logs =====
 experiments_results/
