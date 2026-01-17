@@ -263,7 +263,12 @@
 # def PixArtMS_XL_2(**kwargs):
 #     return PixArtMS(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
-##————————————————————————————
+
+
+
+
+
+#————————————————————————————
 # v2****最好版本 pixartMS.py
 import torch
 import torch.nn as nn
@@ -314,40 +319,11 @@ class PixArtMSBlock(nn.Module):
         self.window_size = window_size
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5)
 
-    def forward(
-        self,
-        x,
-        y,
-        t,
-        mask=None,
-        # ===============================
-        # [NEW] AdaLN/FiLM-style injection
-        # - adaln_shift/adaln_scale: [B, N, C] (token-wise)
-        # - adaln_alpha: scalar (learnable per injection layer)
-        # We apply this on top of norm1(x) BEFORE the built-in t2i_modulate.
-        # This makes the injection operate in a normalized space so it is less
-        # likely to be "washed out" by subsequent normalization.
-        adaln_shift=None,
-        adaln_scale=None,
-        adaln_alpha=None,
-        **kwargs,
-    ):
+    def forward(self, x, y, t, mask=None, **kwargs):
         B, N, C = x.shape
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
 
-        # --------------------------------------------------------------
-        # [NEW] AdaLN/FiLM injection on the normalized tokens
-        # --------------------------------------------------------------
-        if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
-            # Keep it fp32 to avoid LN dtype mismatch when PixArt is fp16.
-            with torch.cuda.amp.autocast(enabled=False):
-                h = self.norm1(x.float())
-                h = h * (1.0 + adaln_alpha.float() * adaln_scale.float()) + adaln_alpha.float() * adaln_shift.float()
-                h = h.to(x.dtype)
-        else:
-            h = self.norm1(x)
-
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa)))
+        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa)))
         x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
@@ -387,19 +363,6 @@ class PixArtMS(PixArt):
         self.input_adapter_ln = nn.LayerNorm(hidden_size, elementwise_affine=True)
 
         # ==========================================================
-        # [NEW] AdaLN/FiLM-style injection params (token-wise)
-        # - Each injection layer has its own (shift, scale) projector.
-        # - Zero-init => initial behavior ~= "no injection" (stability).
-        # - We still use injection_scales as a learnable alpha.
-        # ==========================================================
-        self.input_adaln = nn.ModuleList([
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True) for _ in range(len(self.injection_layers))
-        ])
-        for lin in self.input_adaln:
-            nn.init.zeros_(lin.weight)
-            nn.init.zeros_(lin.bias)
-
-        # ==========================================================
         # Cross-Attn Injection
         # ==========================================================
         self.adapter_proj = nn.Linear(hidden_size, hidden_size)
@@ -410,15 +373,6 @@ class PixArtMS(PixArt):
         self.cross_attn_scale = nn.Parameter(torch.ones(1))
 
         self.initialize()
-
-        # ----------------------------------------------------------
-        # [NEW] Ensure input_adaln stays zero-init.
-        # initialize() applies Xavier init to ALL Linear layers.
-        # For AdaLN/FiLM stability, we want (shift, scale) to start as 0.
-        # ----------------------------------------------------------
-        for lin in self.input_adaln:
-            nn.init.zeros_(lin.weight)
-            nn.init.zeros_(lin.bias)
 
     def forward(
         self,
@@ -514,36 +468,21 @@ class PixArtMS(PixArt):
 
         # 主干循环
         for i, block in enumerate(self.blocks):
-            # --------------------------------------------------------
-            # [CHANGED] Input injection: from additive (x += alpha*feat)
-            #          -> AdaLN/FiLM on norm1(x) inside the block
-            # --------------------------------------------------------
-            if len(adapter_features) > 0 and injection_mode in ['input', 'hybrid'] and i in self.injection_layers:
-                scale_idx = self.injection_layers.index(i)  # 0/1/2/3
-                alpha = self.injection_scales[scale_idx]
-
-                # choose the matching scale feature; fallback to the deepest
-                feat_idx = scale_idx if scale_idx < len(adapter_features) else -1
-                feat_tokens = adapter_features[feat_idx]
-
-                # produce token-wise (shift, scale)
-                with torch.cuda.amp.autocast(enabled=False):
-                    sb = self.input_adaln[scale_idx](feat_tokens.float())  # [B, N, 2C]
-                    adaln_shift, adaln_scale = sb.chunk(2, dim=-1)
-
-                x = auto_grad_checkpoint(
-                    block,
-                    x,
-                    y,
-                    t0,
-                    y_lens,
-                    adaln_shift=adaln_shift,
-                    adaln_scale=adaln_scale,
-                    adaln_alpha=alpha,
-                    **kwargs,
-                )
-            else:
-                x = auto_grad_checkpoint(block, x, y, t0, y_lens, **kwargs)
+            if len(adapter_features) > 0 and injection_mode in ['input', 'hybrid']:
+                if i in self.injection_layers:
+                    # 获取注入层索引 (0, 1, 2, 3)
+                    scale_idx = self.injection_layers.index(i)
+                    current_scale = self.injection_scales[scale_idx]
+                    
+                    # [关键] 从 adapter_features 列表中取出对应层级的特征
+                    # 如果列表长度不够(例如只传了1个)，复用最后一个
+                    feat_idx = scale_idx if scale_idx < len(adapter_features) else -1
+                    current_feat = adapter_features[feat_idx]
+                    
+                    # 注入: x = x + scale * LN(adapter_feat)
+                    x = x + current_scale * current_feat
+            
+            x = auto_grad_checkpoint(block, x, y, t0, y_lens, **kwargs)
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
