@@ -56,6 +56,7 @@ USE_REALISTIC_DEGRADATION = True
 BLUR_KERNEL_SIZES = [3, 5, 7]
 NOISE_STD_RANGE = (0.0, 0.02)
 VALIDATION_STEPS = 20
+VALIDATION_BASE_SEED = 1234
 
 # -----------------------------------------------------------------------------
 # 2. 导入项目模块
@@ -101,11 +102,12 @@ class TrainLatentDataset(Dataset):
         return data
 
 class ValidImageDataset(Dataset):
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, base_seed=0):
         self.files = sorted(glob.glob(os.path.join(root_dir, "*.png")) + 
                             glob.glob(os.path.join(root_dir, "*.jpg")))
         if len(self.files) == 0: print(f"⚠️ Warning: No images found in {root_dir}")
         else: print(f"📂 Validation Set: Found {len(self.files)} samples.")
+        self.base_seed = base_seed
         
         self.transform = transforms.Compose([
             transforms.CenterCrop(512), # 验证时中心裁剪，保证尺寸统一
@@ -120,13 +122,15 @@ class ValidImageDataset(Dataset):
         hr_tensor = self.transform(hr_img)
         
         # 模拟退化：Downsample -> Upsample
+        rng = random.Random(self.base_seed + idx)
         if USE_REALISTIC_DEGRADATION:
-            blur_k = random.choice(BLUR_KERNEL_SIZES)
+            blur_k = rng.choice(BLUR_KERNEL_SIZES)
             hr_blur = TF.gaussian_blur(hr_tensor, blur_k)
             lr_small = F.interpolate(hr_blur.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
-            noise_std = random.uniform(*NOISE_STD_RANGE)
+            noise_std = rng.uniform(*NOISE_STD_RANGE)
             if noise_std > 0:
-                lr_small = lr_small + torch.randn_like(lr_small) * noise_std
+                noise_gen = torch.Generator().manual_seed(self.base_seed + idx)
+                lr_small = lr_small + torch.randn_like(lr_small, generator=noise_gen) * noise_std
                 lr_small = lr_small.clamp(-1.0, 1.0)
         else:
             lr_small = F.interpolate(hr_tensor.unsqueeze(0), scale_factor=0.25, mode='bicubic', align_corners=False)
@@ -205,7 +209,7 @@ def train_full_production():
     
     # 验证集 BS=1
     valid_loader = DataLoader(
-        ValidImageDataset(VALID_DATASET_DIR), 
+        ValidImageDataset(VALID_DATASET_DIR, base_seed=VALIDATION_BASE_SEED), 
         batch_size=1, 
         shuffle=False, 
         num_workers=1
@@ -320,7 +324,10 @@ def run_production_validation(epoch, model, adapter, vae, val_loader, y_embed, d
         return out
 
     start_t = int(1000 * SDE_STRENGTH)
-    step_indices = torch.linspace(start_t, 0, VALIDATION_STEPS, device=DEVICE).long()
+    stride = max(1, start_t // max(1, VALIDATION_STEPS - 1))
+    step_indices = torch.arange(start_t, -1, -stride, device=DEVICE)[:VALIDATION_STEPS]
+    if step_indices.numel() > 0:
+        step_indices[-1] = 0
     
     total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
     count = 0
