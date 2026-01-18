@@ -70,7 +70,7 @@ BATCH_SIZE = 1
 NUM_WORKERS = 0
 LR_ADAPTER = 1e-5
 LR_SCALES  = 1e-4
-GRAD_ACCUM_STEPS = 1
+GRAD_ACCUM_STEPS = 2
 
 SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
@@ -320,6 +320,12 @@ def set_trainable_A(pixart, adapter):
     ])
     return optimizer
 
+# $$ [MOD-INJ-1] 打印注入强度（用于对齐你在 diagnose_control_curve_full_v3.py 的强度扫描结论）
+def log_injection_scales(pixart, tag: str = "train_init"):
+    inj = [float(s.detach().float().cpu().item()) for s in getattr(pixart, "injection_scales", [])]
+    cross = float(getattr(pixart, "cross_attn_scale", torch.tensor(float("nan"))).detach().float().cpu().item())
+    print(f"🔎 [INJECT] {tag} | injection_scales={inj} | cross_attn_scale={cross}")
+
 def build_text_cond():
     y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1)
     y_embed = y_embed.to(DEVICE).to(DTYPE_PIXART)
@@ -399,8 +405,9 @@ def validate_epoch(
             lr_img_11 = lr_img_11.to(DEVICE).float()
 
             # VAE encode（不需要梯度）
-            hr_latent = vae.encode(item_hr).latent_dist.sample() * vae.config.scaling_factor   # [1,4,64,64] fp32
-            lr_latent = vae.encode(lr_img_11).latent_dist.sample() * vae.config.scaling_factor # [1,4,64,64] fp32
+            # $$ [MOD-VAL-1] 评估阶段使用 mode()，避免随机性影响指标
+            # $$ [MOD-VAL-3] 仅保留 lr_latent（hr_latent 在像素域评估中不再需要）
+            lr_latent = vae.encode(lr_img_11).latent_dist.mode() * vae.config.scaling_factor # [1,4,64,64] fp32
 
             # 采样：严格对齐你单样本脚本的写法
             scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
@@ -438,8 +445,8 @@ def validate_epoch(
             pred_img = vae.decode(latents / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
-            gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
-            gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
+            # $$ [MOD-VAL-2] 指标改为像素域 GT（HR 原图），符合 SR 评估规范
+            gt_img_01 = torch.clamp((item_hr + 1.0) / 2.0, 0.0, 1.0)
 
             lr_img_01 = torch.clamp((lr_img_11 + 1.0) / 2.0, 0.0, 1.0)
 
@@ -686,6 +693,7 @@ def main():
     adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
 
     optimizer = set_trainable_A(pixart, adapter)
+    log_injection_scales(pixart, tag="after_set_trainable_A")
     scaler = GradScaler(enabled=USE_AMP)
 
     diffusion = IDDPM(str(1000))
@@ -718,6 +726,9 @@ def main():
         adapter.train()
         pbar = tqdm(train_loader, desc=f"Train Ep{epoch+1}", dynamic_ncols=True)
 
+        optimizer.zero_grad(set_to_none=True)
+        accum_steps = max(1, int(GRAD_ACCUM_STEPS))
+        accum_counter = 0
         for batch in pbar:
             hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
             lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
@@ -726,8 +737,6 @@ def main():
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             noise = torch.randn_like(hr_latent)
             noisy = diffusion.q_sample(hr_latent, t, noise)
-
-            optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())
@@ -746,15 +755,29 @@ def main():
                 loss = F.mse_loss(out.float(), noise.float())
 
             if USE_AMP:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss / accum_steps).backward()
             else:
-                loss.backward()
-                optimizer.step()
+                (loss / accum_steps).backward()
+
+            accum_counter += 1
+            if accum_counter % accum_steps == 0:
+                if USE_AMP:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
+
+        if accum_counter % accum_steps != 0:
+            if USE_AMP:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         # 验证
         vpsnr, vssim, vlp = validate_epoch(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn, max_vis=1)
