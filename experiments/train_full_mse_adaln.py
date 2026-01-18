@@ -403,7 +403,7 @@ def validate_epoch(
 
             # VAE encode（不需要梯度）
             # $$ [MOD-VAL-1] 评估阶段使用 mode()，避免随机性影响指标
-            hr_latent = vae.encode(item_hr).latent_dist.mode() * vae.config.scaling_factor   # [1,4,64,64] fp32
+            # $$ [MOD-VAL-3] 仅保留 lr_latent（hr_latent 在像素域评估中不再需要）
             lr_latent = vae.encode(lr_img_11).latent_dist.mode() * vae.config.scaling_factor # [1,4,64,64] fp32
 
             # 采样：严格对齐你单样本脚本的写法
