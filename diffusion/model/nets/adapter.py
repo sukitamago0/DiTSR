@@ -98,6 +98,7 @@ class ResBlock(nn.Module):
 class MultiLevelAdapter(nn.Module):
     def __init__(self, in_channels=4, hidden_size=1152):
         super().__init__()
+        base_channels = 128
         
         # 1. Stem (64x64, 对应 Layer 0 注入)
         self.stem = nn.Sequential(
@@ -105,7 +106,6 @@ class MultiLevelAdapter(nn.Module):
             ResBlock(64),
             ResBlock(64)
         )
-        self.proj_0 = self._make_projection(64, hidden_size, stride=2)
 
         # 2. Body 1 (32x32, 对应 Layer 7 注入)
         self.body1 = nn.Sequential(
@@ -113,7 +113,6 @@ class MultiLevelAdapter(nn.Module):
             ResBlock(128),
             ResBlock(128)
         )
-        self.proj_1 = self._make_projection(128, hidden_size, stride=1)
 
         # 3. Body 2 (16x16, 对应 Layer 14 注入)
         self.body2 = nn.Sequential(
@@ -121,7 +120,6 @@ class MultiLevelAdapter(nn.Module):
             ResBlock(256),
             ResBlock(256)
         )
-        self.proj_2 = self._make_projection(256, hidden_size, stride=1)
 
         # 4. Body 3 (8x8, 对应 Layer 21 注入)
         self.body3 = nn.Sequential(
@@ -129,7 +127,27 @@ class MultiLevelAdapter(nn.Module):
             ResBlock(512),
             ResBlock(512)
         )
-        self.proj_3 = self._make_projection(512, hidden_size, stride=1)
+
+        # FPN-style lateral projections (统一到 base_channels)
+        self.lat0 = nn.Conv2d(64, base_channels, 1)
+        self.lat1 = nn.Conv2d(128, base_channels, 1)
+        self.lat2 = nn.Conv2d(256, base_channels, 1)
+        self.lat3 = nn.Conv2d(512, base_channels, 1)
+
+        # FPN refinement blocks
+        self.refine0 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
+        self.refine1 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
+        self.refine2 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
+        self.refine3 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
+
+        # 32x32 token-aligned projections (zero-init)
+        self.proj_0 = self._make_projection(base_channels, hidden_size, stride=2)
+        self.proj_1 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_2 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_3 = self._make_projection(base_channels, hidden_size, stride=1)
+
+        # per-scale gates (learned)
+        self.scale_gates = nn.Parameter(torch.ones(4, dtype=torch.float32))
 
     def _make_projection(self, in_ch, out_ch, stride: int):
         # stride=2: 64x64 -> 32x32 (token 对齐)
@@ -147,23 +165,33 @@ class MultiLevelAdapter(nn.Module):
     def forward(self, x):
         # x: [B, 4, 64, 64]
         
-        # Level 0
+        # Bottom-up
         f0 = self.stem(x)           # [B, 64, 64, 64]
-        out0 = self.proj_0(f0)      # [B, 1152, 32, 32]
-        
-        # Level 1
         f1 = self.body1(f0)         # [B, 128, 32, 32]
-        out1 = self.proj_1(f1)      # [B, 1152, 32, 32]
-        
-        # Level 2
         f2 = self.body2(f1)         # [B, 256, 16, 16]
-        f2_up = F.interpolate(f2, size=(32, 32), mode="bilinear", align_corners=False)
-        out2 = self.proj_2(f2_up)   # [B, 1152, 32, 32]
-        
-        # Level 3
         f3 = self.body3(f2)         # [B, 512, 8, 8]
-        f3_up = F.interpolate(f3, size=(32, 32), mode="bilinear", align_corners=False)
-        out3 = self.proj_3(f3_up)   # [B, 1152, 32, 32]
+
+        # Lateral (统一通道) + Top-down fusion
+        p3 = self.lat3(f3)
+        p2 = self.lat2(f2) + F.interpolate(p3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        p1 = self.lat1(f1) + F.interpolate(p2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        p0 = self.lat0(f0) + F.interpolate(p1, size=f0.shape[-2:], mode="bilinear", align_corners=False)
+
+        # Refine each scale
+        p0 = self.refine0(p0)
+        p1 = self.refine1(p1)
+        p2 = self.refine2(p2)
+        p3 = self.refine3(p3)
+
+        # Token-aligned outputs (32x32)
+        out0 = self.proj_0(p0) * self.scale_gates[0]
+        out1 = self.proj_1(p1) * self.scale_gates[1]
+
+        p2_up = F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)
+        out2 = self.proj_2(p2_up) * self.scale_gates[2]
+
+        p3_up = F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)
+        out3 = self.proj_3(p3_up) * self.scale_gates[3]
         
         # 返回列表
         return [out0, out1, out2, out3]
