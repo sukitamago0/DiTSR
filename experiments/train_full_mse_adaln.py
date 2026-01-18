@@ -91,6 +91,9 @@ METRIC_Y_CHANNEL = True
 # $$ [MOD-METRIC-2] 常见 SR 评估会 shave border（x4 通常=4）。如果你想“完全不裁边”，设为 0。
 METRIC_SHAVE_BORDER = 4
 
+# $$ [MOD-LOSS-1] 追加 x0 重建损失（训练用），用于提升 SR 细节收敛稳定性
+X0_LOSS_WEIGHT = 0.1
+
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 
@@ -399,8 +402,9 @@ def validate_epoch(
             lr_img_11 = lr_img_11.to(DEVICE).float()
 
             # VAE encode（不需要梯度）
-            hr_latent = vae.encode(item_hr).latent_dist.sample() * vae.config.scaling_factor   # [1,4,64,64] fp32
-            lr_latent = vae.encode(lr_img_11).latent_dist.sample() * vae.config.scaling_factor # [1,4,64,64] fp32
+            # $$ [MOD-VAL-1] 评估阶段使用 mode()，避免随机性影响指标
+            # $$ [MOD-VAL-3] 仅保留 lr_latent（hr_latent 在像素域评估中不再需要）
+            lr_latent = vae.encode(lr_img_11).latent_dist.mode() * vae.config.scaling_factor # [1,4,64,64] fp32
 
             # 采样：严格对齐你单样本脚本的写法
             scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
@@ -438,8 +442,8 @@ def validate_epoch(
             pred_img = vae.decode(latents / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
-            gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
-            gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
+            # $$ [MOD-VAL-2] 指标改为像素域 GT（HR 原图），符合 SR 评估规范
+            gt_img_01 = torch.clamp((item_hr + 1.0) / 2.0, 0.0, 1.0)
 
             lr_img_01 = torch.clamp((lr_img_11 + 1.0) / 2.0, 0.0, 1.0)
 
@@ -743,7 +747,18 @@ def main():
                 )
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
-                loss = F.mse_loss(out.float(), noise.float())
+                loss_eps = F.mse_loss(out.float(), noise.float())
+
+                # $$ [MOD-LOSS-2] x0 重建损失：从 eps 预测 x0（与 hr_latent 对齐）
+                with torch.cuda.amp.autocast(enabled=False):
+                    pred_x0 = diffusion._predict_xstart_from_eps(
+                        x_t=noisy.float(),
+                        t=t,
+                        eps=out.float(),
+                    )
+                    loss_x0 = F.mse_loss(pred_x0, hr_latent.float())
+
+                loss = loss_eps + X0_LOSS_WEIGHT * loss_x0
 
             if USE_AMP:
                 scaler.scale(loss).backward()
