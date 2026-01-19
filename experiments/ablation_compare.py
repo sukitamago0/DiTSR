@@ -3,6 +3,7 @@ import argparse
 import math
 import os
 import random
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(PROJECT_ROOT)
 
 from experiments.train_full_mse_adaln import (
     DEVICE,
