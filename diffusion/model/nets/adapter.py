@@ -95,6 +95,21 @@ class ResBlock(nn.Module):
         h = self.conv2(h)
         return x + h
 
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, channels // reduction, 1)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Conv2d(channels // reduction, channels, 1)
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x):
+        w = self.pool(x)
+        w = self.act(self.fc1(w))
+        w = self.gate(self.fc2(w))
+        return x * w
+
 class MultiLevelAdapter(nn.Module):
     def __init__(self, in_channels=4, hidden_size=1152):
         super().__init__()
@@ -195,3 +210,88 @@ class MultiLevelAdapter(nn.Module):
         
         # 返回列表
         return [out0, out1, out2, out3]
+
+class MultiLevelAdapterSE(nn.Module):
+    def __init__(self, in_channels=4, hidden_size=1152):
+        super().__init__()
+        base_channels = 128
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1),
+            ResBlock(64),
+            ResBlock(64),
+        )
+
+        self.body1 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1, stride=2),
+            ResBlock(128),
+            ResBlock(128),
+        )
+
+        self.body2 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, padding=1, stride=2),
+            ResBlock(256),
+            ResBlock(256),
+        )
+
+        self.body3 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, padding=1, stride=2),
+            ResBlock(512),
+            ResBlock(512),
+        )
+
+        self.lat0 = nn.Conv2d(64, base_channels, 1)
+        self.lat1 = nn.Conv2d(128, base_channels, 1)
+        self.lat2 = nn.Conv2d(256, base_channels, 1)
+        self.lat3 = nn.Conv2d(512, base_channels, 1)
+
+        self.refine0 = nn.Sequential(ResBlock(base_channels), SEBlock(base_channels))
+        self.refine1 = nn.Sequential(ResBlock(base_channels), SEBlock(base_channels))
+        self.refine2 = nn.Sequential(ResBlock(base_channels), SEBlock(base_channels))
+        self.refine3 = nn.Sequential(ResBlock(base_channels), SEBlock(base_channels))
+
+        self.proj_0 = self._make_projection(base_channels, hidden_size, stride=2)
+        self.proj_1 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_2 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_3 = self._make_projection(base_channels, hidden_size, stride=1)
+
+        self.scale_gates = nn.Parameter(torch.ones(4, dtype=torch.float32))
+
+    def _make_projection(self, in_ch, out_ch, stride: int):
+        proj = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, stride=stride),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 1),
+        )
+        nn.init.zeros_(proj[-1].weight)
+        nn.init.zeros_(proj[-1].bias)
+        return proj
+
+    def forward(self, x):
+        f0 = self.stem(x)
+        f1 = self.body1(f0)
+        f2 = self.body2(f1)
+        f3 = self.body3(f2)
+
+        p3 = self.lat3(f3)
+        p2 = self.lat2(f2) + F.interpolate(p3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        p1 = self.lat1(f1) + F.interpolate(p2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        p0 = self.lat0(f0) + F.interpolate(p1, size=f0.shape[-2:], mode="bilinear", align_corners=False)
+
+        p0 = self.refine0(p0)
+        p1 = self.refine1(p1)
+        p2 = self.refine2(p2)
+        p3 = self.refine3(p3)
+
+        out0 = self.proj_0(p0) * self.scale_gates[0]
+        out1 = self.proj_1(p1) * self.scale_gates[1]
+        out2 = self.proj_2(F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[2]
+        out3 = self.proj_3(F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[3]
+        return [out0, out1, out2, out3]
+
+def build_adapter(adapter_type: str, in_channels: int = 4, hidden_size: int = 1152):
+    if adapter_type == "fpn":
+        return MultiLevelAdapter(in_channels=in_channels, hidden_size=hidden_size)
+    if adapter_type == "fpn_se":
+        return MultiLevelAdapterSE(in_channels=in_channels, hidden_size=hidden_size)
+    raise ValueError(f"Unknown adapter_type: {adapter_type}")

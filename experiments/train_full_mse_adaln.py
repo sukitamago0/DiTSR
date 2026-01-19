@@ -65,7 +65,7 @@ DTYPE_PIXART = torch.float16  # PixArt 主干用 FP16 省显存
 DTYPE_LATENT = torch.float16  # 你离线 latent 就是 FP16
 USE_AMP = (DEVICE == "cuda")
 
-EPOCHS = 100
+EPOCHS = int(os.getenv("EPOCHS_OVERRIDE", "100"))
 BATCH_SIZE = 1
 NUM_WORKERS = 0
 LR_ADAPTER = 1e-5
@@ -99,7 +99,7 @@ LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 # -------------------------
 try:
     from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
-    from diffusion.model.nets.adapter import MultiLevelAdapter
+    from diffusion.model.nets.adapter import build_adapter
     from diffusion import IDDPM
 except ImportError as e:
     print(f"❌ Import failed: {e}")
@@ -660,6 +660,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
+    parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
     args = parser.parse_args()
     SMOKE = bool(args.smoke)
 
@@ -690,7 +691,7 @@ def main():
     pixart.load_state_dict(ckpt, strict=False)
 
     print("Loading Adapter...")
-    adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
+    adapter = build_adapter(args.adapter_type, in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
 
     optimizer = set_trainable_A(pixart, adapter)
     log_injection_scales(pixart, tag="after_set_trainable_A")
