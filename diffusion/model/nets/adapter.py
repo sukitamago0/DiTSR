@@ -164,6 +164,13 @@ class MultiLevelAdapter(nn.Module):
         # per-scale gates (learned)
         self.scale_gates = nn.Parameter(torch.ones(4, dtype=torch.float32))
 
+        # reconstruction head (predicts HR latent base from p0)
+        self.recon_head = nn.Sequential(
+            ResBlock(base_channels),
+            ResBlock(base_channels),
+            nn.Conv2d(base_channels, in_channels, 1),
+        )
+
     def _make_projection(self, in_ch, out_ch, stride: int):
         # stride=2: 64x64 -> 32x32 (token 对齐)
         # stride=1: 已经是 32x32
@@ -177,9 +184,7 @@ class MultiLevelAdapter(nn.Module):
         nn.init.zeros_(proj[-1].bias)
         return proj
 
-    def forward(self, x):
-        # x: [B, 4, 64, 64]
-        
+    def _forward_features(self, x):
         # Bottom-up
         f0 = self.stem(x)           # [B, 64, 64, 64]
         f1 = self.body1(f0)         # [B, 128, 32, 32]
@@ -197,6 +202,11 @@ class MultiLevelAdapter(nn.Module):
         p1 = self.refine1(p1)
         p2 = self.refine2(p2)
         p3 = self.refine3(p3)
+        return p0, p1, p2, p3
+
+    def forward(self, x):
+        # x: [B, 4, 64, 64]
+        p0, p1, p2, p3 = self._forward_features(x)
 
         # Token-aligned outputs (32x32)
         out0 = self.proj_0(p0) * self.scale_gates[0]
@@ -207,9 +217,16 @@ class MultiLevelAdapter(nn.Module):
 
         p3_up = F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)
         out3 = self.proj_3(p3_up) * self.scale_gates[3]
-        
-        # 返回列表
         return [out0, out1, out2, out3]
+
+    def forward_with_recon(self, x):
+        p0, p1, p2, p3 = self._forward_features(x)
+        recon = self.recon_head(p0)
+        out0 = self.proj_0(p0) * self.scale_gates[0]
+        out1 = self.proj_1(p1) * self.scale_gates[1]
+        out2 = self.proj_2(F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[2]
+        out3 = self.proj_3(F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[3]
+        return [out0, out1, out2, out3], recon
 
 class MultiLevelAdapterSE(nn.Module):
     def __init__(self, in_channels=4, hidden_size=1152):
@@ -256,6 +273,11 @@ class MultiLevelAdapterSE(nn.Module):
         self.proj_3 = self._make_projection(base_channels, hidden_size, stride=1)
 
         self.scale_gates = nn.Parameter(torch.ones(4, dtype=torch.float32))
+        self.recon_head = nn.Sequential(
+            ResBlock(base_channels),
+            ResBlock(base_channels),
+            nn.Conv2d(base_channels, in_channels, 1),
+        )
 
     def _make_projection(self, in_ch, out_ch, stride: int):
         proj = nn.Sequential(
@@ -267,7 +289,7 @@ class MultiLevelAdapterSE(nn.Module):
         nn.init.zeros_(proj[-1].bias)
         return proj
 
-    def forward(self, x):
+    def _forward_features(self, x):
         f0 = self.stem(x)
         f1 = self.body1(f0)
         f2 = self.body2(f1)
@@ -282,12 +304,24 @@ class MultiLevelAdapterSE(nn.Module):
         p1 = self.refine1(p1)
         p2 = self.refine2(p2)
         p3 = self.refine3(p3)
+        return p0, p1, p2, p3
 
+    def forward(self, x):
+        p0, p1, p2, p3 = self._forward_features(x)
         out0 = self.proj_0(p0) * self.scale_gates[0]
         out1 = self.proj_1(p1) * self.scale_gates[1]
         out2 = self.proj_2(F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[2]
         out3 = self.proj_3(F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[3]
         return [out0, out1, out2, out3]
+
+    def forward_with_recon(self, x):
+        p0, p1, p2, p3 = self._forward_features(x)
+        recon = self.recon_head(p0)
+        out0 = self.proj_0(p0) * self.scale_gates[0]
+        out1 = self.proj_1(p1) * self.scale_gates[1]
+        out2 = self.proj_2(F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[2]
+        out3 = self.proj_3(F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[3]
+        return [out0, out1, out2, out3], recon
 
 def build_adapter(adapter_type: str, in_channels: int = 4, hidden_size: int = 1152):
     if adapter_type == "fpn":

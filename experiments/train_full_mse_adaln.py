@@ -91,6 +91,9 @@ METRIC_Y_CHANNEL = True
 # $$ [MOD-METRIC-2] 常见 SR 评估会 shave border（x4 通常=4）。如果你想“完全不裁边”，设为 0。
 METRIC_SHAVE_BORDER = 4
 
+# reconstruction branch (adapter base) weight
+RECON_LOSS_WEIGHT = 0.1
+
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 
@@ -740,7 +743,7 @@ def main():
             noisy = diffusion.q_sample(hr_latent, t, noise)
 
             with torch.cuda.amp.autocast(enabled=False):
-                cond = adapter(lr_latent.float())
+                cond, recon_base = adapter.forward_with_recon(lr_latent.float())
 
             with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
                 out = pixart(
@@ -754,6 +757,8 @@ def main():
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
+                recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
+                loss = loss + RECON_LOSS_WEIGHT * recon_loss
 
             if USE_AMP:
                 scaler.scale(loss / accum_steps).backward()
@@ -770,7 +775,11 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "recon": f"{recon_loss.item():.4f}",
+                "seen": global_step,
+            })
 
         if accum_counter % accum_steps != 0:
             if USE_AMP:
