@@ -95,6 +95,8 @@ METRIC_SHAVE_BORDER = 4
 RECON_LOSS_WEIGHT = 0.1
 # $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
 RECON_BASE_START = True
+# $$ [MOD-EDGE-1] 轻量边缘损失权重（提升纹理/细节，不引入额外网络）
+EDGE_LOSS_WEIGHT = 0.05
 
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
@@ -363,6 +365,30 @@ def shave_border(x: torch.Tensor, shave: int) -> torch.Tensor:
     if shave <= 0:
         return x
     return x[..., shave:-shave, shave:-shave]
+
+# $$ [MOD-EDGE-2] Sobel 边缘算子（按 batch 计算）
+def sobel_edges(x: torch.Tensor) -> torch.Tensor:
+    # x: [B, C, H, W]
+    kernel_x = torch.tensor(
+        [[-1, 0, 1],
+         [-2, 0, 2],
+         [-1, 0, 1]],
+        dtype=x.dtype,
+        device=x.device,
+    ).view(1, 1, 3, 3)
+    kernel_y = torch.tensor(
+        [[-1, -2, -1],
+         [ 0,  0,  0],
+         [ 1,  2,  1]],
+        dtype=x.dtype,
+        device=x.device,
+    ).view(1, 1, 3, 3)
+    b, c, _, _ = x.shape
+    kx = kernel_x.repeat(c, 1, 1, 1)
+    ky = kernel_y.repeat(c, 1, 1, 1)
+    gx = F.conv2d(x, kx, padding=1, groups=c)
+    gy = F.conv2d(x, ky, padding=1, groups=c)
+    return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
 # -------------------------
 # 7) 验证：沿用你单样本的 “SDE_STRENGTH + DPMSolver” 逻辑
@@ -769,9 +795,14 @@ def main():
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
                 recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
+                # $$ [MOD-EDGE-3] 轻量边缘损失（latent 空间）
+                edge_pred = sobel_edges(recon_base.float())
+                edge_gt = sobel_edges(hr_latent.float())
+                edge_loss = F.l1_loss(edge_pred, edge_gt)
                 # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
                 recon_weight = torch.exp(-adapter.recon_log_sigma.float())
                 loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
+                loss = loss + EDGE_LOSS_WEIGHT * edge_loss
 
             if USE_AMP:
                 scaler.scale(loss / accum_steps).backward()
@@ -792,6 +823,7 @@ def main():
                 "loss": f"{loss.item():.4f}",
                 "recon": f"{recon_loss.item():.4f}",
                 "recon_w": f"{recon_weight.item():.4f}",
+                "edge": f"{edge_loss.item():.4f}",
                 "seen": global_step,
             })
 
