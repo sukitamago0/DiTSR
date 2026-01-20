@@ -113,6 +113,7 @@ def run_epoch(mode: str, pixart, adapter, vae, dl, y_embed, data_info, lpips_fn=
                     cond = None
                     if mode == "joint":
                         cond, _ = adapter.forward_with_recon(lr_latent.float())
+                        cond = [feat.float() for feat in cond]
 
                 for t in run_ts:
                     t_tensor = t.unsqueeze(0).to(DEVICE)
