@@ -124,8 +124,10 @@ def run_epoch(mode: str, pixart, adapter, vae, dl, y_embed, data_info, lpips_fn=
                 g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
                 if use_recon_init:
                     _, recon_base = adapter.forward_with_recon(lr_latent.float())
+                    # joint_recon: use adapter-predicted HR-structure base as the diffusion start
                     latents = recon_base.to(DEVICE)
                 else:
+                    # joint/pixart_only: start from LR latent (legacy behavior)
                     latents = lr_latent.to(DEVICE)
                 noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
                 t_start = torch.tensor([start_t_val], device=DEVICE).long()
