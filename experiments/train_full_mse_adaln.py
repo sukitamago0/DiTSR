@@ -652,10 +652,18 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
+    parser.add_argument("--smoke_train", type=int, default=None, help="override smoke train samples")
+    parser.add_argument("--smoke_val", type=int, default=None, help="override smoke val samples")
+    parser.add_argument("--smoke_epochs", type=int, default=None, help="override smoke epochs")
     parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
     args = parser.parse_args()
     SMOKE = bool(args.smoke)
+    if args.smoke_train is not None:
+        SMOKE_TRAIN_SAMPLES = int(args.smoke_train)
+    if args.smoke_val is not None:
+        SMOKE_VAL_SAMPLES = int(args.smoke_val)
+    smoke_epochs = int(args.smoke_epochs) if args.smoke_epochs is not None else None
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
@@ -713,7 +721,7 @@ def main():
         )
 
     # 训练
-    total_epochs = (EPOCHS if not SMOKE else 1)
+    total_epochs = EPOCHS if not SMOKE else (smoke_epochs if smoke_epochs is not None else 1)
     for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
