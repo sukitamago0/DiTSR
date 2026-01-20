@@ -769,7 +769,9 @@ def main():
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
                 recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
-                loss = loss + RECON_LOSS_WEIGHT * recon_loss
+                # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
+                recon_weight = torch.exp(-adapter.recon_log_sigma.float())
+                loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
 
             if USE_AMP:
                 scaler.scale(loss / accum_steps).backward()
@@ -789,6 +791,7 @@ def main():
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "recon": f"{recon_loss.item():.4f}",
+                "recon_w": f"{recon_weight.item():.4f}",
                 "seen": global_step,
             })
 

@@ -170,6 +170,8 @@ class MultiLevelAdapter(nn.Module):
             ResBlock(base_channels),
             nn.Conv2d(base_channels, in_channels, 1),
         )
+        # learnable uncertainty for recon loss (lets the model balance recon vs. denoise)
+        self.recon_log_sigma = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def _make_projection(self, in_ch, out_ch, stride: int):
         # stride=2: 64x64 -> 32x32 (token 对齐)
@@ -278,6 +280,8 @@ class MultiLevelAdapterSE(nn.Module):
             ResBlock(base_channels),
             nn.Conv2d(base_channels, in_channels, 1),
         )
+        # learnable uncertainty for recon loss (lets the model balance recon vs. denoise)
+        self.recon_log_sigma = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def _make_projection(self, in_ch, out_ch, stride: int):
         proj = nn.Sequential(
