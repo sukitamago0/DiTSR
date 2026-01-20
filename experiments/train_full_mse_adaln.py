@@ -75,6 +75,7 @@ GRAD_ACCUM_STEPS = 2
 SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
 SMOKE_VAL_SAMPLES = 20
+SMOKE_EPOCHS = 1
 
 NUM_INFER_STEPS = 20
 SDE_STRENGTH = 0.45
@@ -700,6 +701,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
+    parser.add_argument("--smoke_train", type=int, default=SMOKE_TRAIN_SAMPLES, help="override smoke train samples")
+    parser.add_argument("--smoke_val", type=int, default=SMOKE_VAL_SAMPLES, help="override smoke val samples")
+    parser.add_argument("--smoke_epochs", type=int, default=SMOKE_EPOCHS, help="override smoke epochs")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
     parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
     args = parser.parse_args()
@@ -708,8 +712,8 @@ def main():
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
-    train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
-    val_max   = SMOKE_VAL_SAMPLES if SMOKE else None
+    train_max = args.smoke_train if SMOKE else None
+    val_max   = args.smoke_val if SMOKE else None
 
     train_ds = TrainLatentDataset(TRAIN_LATENT_DIR, max_files=train_max)
     train_loader = DataLoader(
@@ -762,7 +766,7 @@ def main():
         )
 
     # 训练
-    total_epochs = (EPOCHS if not SMOKE else 1)
+    total_epochs = (EPOCHS if not SMOKE else int(args.smoke_epochs))
     for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
