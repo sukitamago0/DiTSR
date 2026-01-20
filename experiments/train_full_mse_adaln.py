@@ -452,6 +452,8 @@ def validate_epoch(
             # $$ [MOD-RECON-START-2] 可选：以 recon_base 作为扩散起点
             if RECON_BASE_START:
                 _, recon_base = adapter.forward_with_recon(lr_latent.float())
+                # $$ [MOD-NAN-3] 防止 recon_base 在验证中产生 NaN/Inf
+                recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
                 latents = recon_base.to(DEVICE)
             else:
                 latents = lr_latent.to(DEVICE)  # fp32
@@ -777,6 +779,8 @@ def main():
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             with torch.cuda.amp.autocast(enabled=False):
                 cond, recon_base = adapter.forward_with_recon(lr_latent.float())
+                # $$ [MOD-NAN-1] 防止 recon_base 出现 NaN/Inf 传播到扩散起点
+                recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
             noise = torch.randn_like(hr_latent)
             # $$ [MOD-RECON-START-3] 训练时用 recon_base 作为扩散起点，减少训练/推理分布偏移
             noisy_start = recon_base if RECON_BASE_START else hr_latent
@@ -803,6 +807,9 @@ def main():
                 recon_weight = torch.exp(-adapter.recon_log_sigma.float())
                 loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
                 loss = loss + EDGE_LOSS_WEIGHT * edge_loss
+                # $$ [MOD-NAN-2] 训练损失兜底，避免 NaN 使训练崩溃
+                if not torch.isfinite(loss):
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
             if USE_AMP:
                 scaler.scale(loss / accum_steps).backward()
