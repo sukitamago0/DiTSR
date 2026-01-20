@@ -93,7 +93,7 @@ METRIC_Y_CHANNEL = True
 METRIC_SHAVE_BORDER = 4
 
 # reconstruction branch controls
-USE_RECON_LOSS = False
+USE_RECON_LOSS = True
 RECON_LOSS_WEIGHT = 0.1
 # $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
 RECON_BASE_START = True
