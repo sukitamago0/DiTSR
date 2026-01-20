@@ -92,7 +92,8 @@ METRIC_Y_CHANNEL = True
 # $$ [MOD-METRIC-2] 常见 SR 评估会 shave border（x4 通常=4）。如果你想“完全不裁边”，设为 0。
 METRIC_SHAVE_BORDER = 4
 
-# reconstruction branch (adapter base) weight
+# reconstruction branch controls
+USE_RECON_LOSS = False
 RECON_LOSS_WEIGHT = 0.1
 # $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
 RECON_BASE_START = True
@@ -451,7 +452,7 @@ def validate_epoch(
 
             g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
             # $$ [MOD-RECON-START-2] 可选：以 recon_base 作为扩散起点
-            if RECON_BASE_START:
+            if USE_RECON_LOSS and RECON_BASE_START:
                 _, recon_base = adapter.forward_with_recon(lr_latent.float())
                 # $$ [MOD-NAN-3] 防止 recon_base 在验证中产生 NaN/Inf
                 recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -463,7 +464,7 @@ def validate_epoch(
             latents = scheduler.add_noise(latents, noise, t_start)
 
             with torch.cuda.amp.autocast(enabled=False):
-                if RECON_BASE_START:
+                if USE_RECON_LOSS and RECON_BASE_START:
                     cond, _ = adapter.forward_with_recon(lr_latent.float())
                 else:
                     cond = adapter(lr_latent.float())  # fp32 list
@@ -782,12 +783,16 @@ def main():
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             with torch.cuda.amp.autocast(enabled=False):
-                cond, recon_base = adapter.forward_with_recon(lr_latent.float())
-                # $$ [MOD-NAN-1] 防止 recon_base 出现 NaN/Inf 传播到扩散起点
-                recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                if USE_RECON_LOSS:
+                    cond, recon_base = adapter.forward_with_recon(lr_latent.float())
+                    # $$ [MOD-NAN-1] 防止 recon_base 出现 NaN/Inf 传播到扩散起点
+                    recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                else:
+                    cond = adapter(lr_latent.float())
+                    recon_base = None
             noise = torch.randn_like(hr_latent)
             # $$ [MOD-RECON-START-3] 训练时用 recon_base 作为扩散起点，减少训练/推理分布偏移
-            noisy_start = recon_base if RECON_BASE_START else hr_latent
+            noisy_start = recon_base if (USE_RECON_LOSS and RECON_BASE_START) else hr_latent
             noisy = diffusion.q_sample(noisy_start, t, noise)
 
             with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
@@ -802,15 +807,19 @@ def main():
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
-                recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
-                # $$ [MOD-EDGE-3] 轻量边缘损失（latent 空间）
-                edge_pred = sobel_edges(recon_base.float())
-                edge_gt = sobel_edges(hr_latent.float())
-                edge_loss = F.l1_loss(edge_pred, edge_gt)
-                # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
-                recon_weight = torch.exp(-adapter.recon_log_sigma.float())
-                loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
-                loss = loss + EDGE_LOSS_WEIGHT * edge_loss
+                recon_loss = None
+                recon_weight = None
+                edge_loss = None
+                if USE_RECON_LOSS:
+                    recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
+                    # $$ [MOD-EDGE-3] 轻量边缘损失（latent 空间）
+                    edge_pred = sobel_edges(recon_base.float())
+                    edge_gt = sobel_edges(hr_latent.float())
+                    edge_loss = F.l1_loss(edge_pred, edge_gt)
+                    # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
+                    recon_weight = torch.exp(-adapter.recon_log_sigma.float())
+                    loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
+                    loss = loss + EDGE_LOSS_WEIGHT * edge_loss
                 # $$ [MOD-NAN-2] 训练损失兜底，避免 NaN 使训练崩溃
                 if not torch.isfinite(loss):
                     loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -830,13 +839,17 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{loss.item():.4f}",
-                "recon": f"{recon_loss.item():.4f}",
-                "recon_w": f"{recon_weight.item():.4f}",
-                "edge": f"{edge_loss.item():.4f}",
                 "seen": global_step,
-            })
+            }
+            if USE_RECON_LOSS:
+                postfix.update({
+                    "recon": f"{recon_loss.item():.4f}",
+                    "recon_w": f"{recon_weight.item():.4f}",
+                    "edge": f"{edge_loss.item():.4f}",
+                })
+            pbar.set_postfix(postfix)
 
         if accum_counter % accum_steps != 0:
             if USE_AMP:
