@@ -93,6 +93,8 @@ METRIC_SHAVE_BORDER = 4
 
 # reconstruction branch (adapter base) weight
 RECON_LOSS_WEIGHT = 0.1
+# $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
+RECON_BASE_START = True
 
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
@@ -421,13 +423,21 @@ def validate_epoch(
             run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
 
             g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-            latents = lr_latent.to(DEVICE)  # fp32
+            # $$ [MOD-RECON-START-2] 可选：以 recon_base 作为扩散起点
+            if RECON_BASE_START:
+                _, recon_base = adapter.forward_with_recon(lr_latent.float())
+                latents = recon_base.to(DEVICE)
+            else:
+                latents = lr_latent.to(DEVICE)  # fp32
             noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
             t_start = torch.tensor([start_t_val], device=DEVICE).long()
             latents = scheduler.add_noise(latents, noise, t_start)
 
             with torch.cuda.amp.autocast(enabled=False):
-                cond = adapter(lr_latent.float())  # fp32 list
+                if RECON_BASE_START:
+                    cond, _ = adapter.forward_with_recon(lr_latent.float())
+                else:
+                    cond = adapter(lr_latent.float())  # fp32 list
 
             for t in run_ts:
                 t_tensor = t.unsqueeze(0).to(DEVICE)
@@ -739,11 +749,12 @@ def main():
 
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
-            noise = torch.randn_like(hr_latent)
-            noisy = diffusion.q_sample(hr_latent, t, noise)
-
             with torch.cuda.amp.autocast(enabled=False):
                 cond, recon_base = adapter.forward_with_recon(lr_latent.float())
+            noise = torch.randn_like(hr_latent)
+            # $$ [MOD-RECON-START-3] 训练时用 recon_base 作为扩散起点，减少训练/推理分布偏移
+            noisy_start = recon_base if RECON_BASE_START else hr_latent
+            noisy = diffusion.q_sample(noisy_start, t, noise)
 
             with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
                 out = pixart(
