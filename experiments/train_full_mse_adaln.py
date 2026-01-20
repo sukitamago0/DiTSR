@@ -99,7 +99,7 @@ LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 # -------------------------
 try:
     from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
-    from diffusion.model.nets.adapter import MultiLevelAdapter
+    from diffusion.model.nets.adapter import build_adapter
     from diffusion import IDDPM
 except ImportError as e:
     print(f"❌ Import failed: {e}")
@@ -125,6 +125,22 @@ class TrainLatentDataset(Dataset):
         hr = d["hr_latent"]  # [4,64,64] fp16
         lr = d["lr_latent"]  # [4,64,64] fp16
         return {"hr_latent": hr, "lr_latent": lr, "path": self.paths[idx]}
+
+
+class SingleLatentDataset(Dataset):
+    def __init__(self, latent_path: str):
+        if not os.path.isfile(latent_path):
+            raise FileNotFoundError(f"Latent file not found: {latent_path}")
+        self.latent_path = latent_path
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        d = torch.load(self.latent_path, map_location="cpu")
+        hr = d["hr_latent"]
+        lr = d["lr_latent"]
+        return {"hr_latent": hr, "lr_latent": lr, "path": self.latent_path}
 
 def scan_latent_schema(root_dir: str, n: int = 50):
     paths = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
@@ -492,6 +508,96 @@ def validate_epoch(
     avg_lp   = sum(lpips_list)/len(lpips_list) if len(lpips_list)>0 else float("nan")
     return avg_psnr, avg_ssim, avg_lp
 
+
+@torch.no_grad()
+def validate_overfit_latent(
+    epoch: int,
+    pixart,
+    adapter,
+    vae,
+    latent_loader,
+    y_embed,
+    data_info,
+    lpips_fn=None,
+):
+    pixart.eval()
+    adapter.eval()
+
+    psnr_list, ssim_list, lpips_list = [], [], []
+    pbar = tqdm(latent_loader, desc=f"Valid Ep{epoch+1}", dynamic_ncols=True)
+    for batch in pbar:
+        hr_latent = batch["hr_latent"].to(DEVICE).to(torch.float32)
+        lr_latent = batch["lr_latent"].to(DEVICE).to(torch.float32)
+
+        scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
+        scheduler.set_timesteps(NUM_INFER_STEPS, device=DEVICE)
+        start_t_val = int(1000 * SDE_STRENGTH)
+        run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
+
+        g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
+        # 过拟合验证与训练保持一致：主干从 LR latent 加噪开始
+        latents = lr_latent.to(DEVICE)
+        noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
+        t_start = torch.tensor([start_t_val], device=DEVICE).long()
+        latents = scheduler.add_noise(latents, noise, t_start)
+
+        with torch.cuda.amp.autocast(enabled=False):
+            cond = adapter(lr_latent.float())
+
+        for t in run_ts:
+            t_tensor = t.unsqueeze(0).to(DEVICE)
+            with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
+                out = pixart(
+                    latents.to(DTYPE_PIXART),
+                    t_tensor,
+                    y_embed,
+                    data_info=data_info,
+                    adapter_cond=cond,
+                    injection_mode="hybrid",
+                )
+                if out.shape[1] == 8:
+                    out, _ = out.chunk(2, dim=1)
+            latents = scheduler.step(out.float(), t, latents.float()).prev_sample
+
+        pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+        pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+
+        gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
+        gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
+
+        if USE_METRICS:
+            if METRIC_Y_CHANNEL:
+                pred_y = rgb01_to_y01(pred_img_01)
+                gt_y   = rgb01_to_y01(gt_img_01)
+                pred_y = shave_border(pred_y, METRIC_SHAVE_BORDER)
+                gt_y   = shave_border(gt_y, METRIC_SHAVE_BORDER)
+                p = psnr(pred_y, gt_y, data_range=1.0).item()
+                s = ssim(pred_y, gt_y, data_range=1.0).item()
+            else:
+                p = psnr(pred_img_01, gt_img_01, data_range=1.0).item()
+                s = ssim(pred_img_01, gt_img_01, data_range=1.0).item()
+
+            psnr_list.append(p)
+            ssim_list.append(s)
+
+            if lpips_fn is not None:
+                pred_norm = pred_img_01 * 2.0 - 1.0
+                gt_norm   = gt_img_01 * 2.0 - 1.0
+                l = lpips_fn(pred_norm, gt_norm).item()
+                lpips_list.append(l)
+
+        if USE_METRICS and len(psnr_list) > 0:
+            pbar.set_postfix({
+                "PSNR": f"{sum(psnr_list)/len(psnr_list):.2f}",
+                "SSIM": f"{sum(ssim_list)/len(ssim_list):.4f}",
+                "LPIPS": f"{(sum(lpips_list)/len(lpips_list)):.4f}" if len(lpips_list)>0 else "NA"
+            })
+
+    avg_psnr = sum(psnr_list)/len(psnr_list) if len(psnr_list)>0 else float("nan")
+    avg_ssim = sum(ssim_list)/len(ssim_list) if len(ssim_list)>0 else float("nan")
+    avg_lp   = sum(lpips_list)/len(lpips_list) if len(lpips_list)>0 else float("nan")
+    return avg_psnr, avg_ssim, avg_lp
+
 def extract_inject_state_dict(pixart) -> Dict[str, torch.Tensor]:
     sd = pixart.state_dict()
     keep = {}
@@ -652,9 +758,19 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
+    parser.add_argument("--smoke_train", type=int, default=None, help="override smoke train samples")
+    parser.add_argument("--smoke_val", type=int, default=None, help="override smoke val samples")
+    parser.add_argument("--smoke_epochs", type=int, default=None, help="override smoke epochs")
+    parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
+    parser.add_argument("--overfit_latent_path", type=str, default=None, help="use one latent file for strict overfit train+val")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
     args = parser.parse_args()
     SMOKE = bool(args.smoke)
+    if args.smoke_train is not None:
+        SMOKE_TRAIN_SAMPLES = int(args.smoke_train)
+    if args.smoke_val is not None:
+        SMOKE_VAL_SAMPLES = int(args.smoke_val)
+    smoke_epochs = int(args.smoke_epochs) if args.smoke_epochs is not None else None
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
@@ -662,18 +778,25 @@ def main():
     train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
     val_max   = SMOKE_VAL_SAMPLES if SMOKE else None
 
-    train_ds = TrainLatentDataset(TRAIN_LATENT_DIR, max_files=train_max)
+    if args.overfit_latent_path:
+        train_ds = SingleLatentDataset(args.overfit_latent_path)
+    else:
+        train_ds = TrainLatentDataset(TRAIN_LATENT_DIR, max_files=train_max)
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=NUM_WORKERS, pin_memory=(DEVICE=="cuda"),
         drop_last=True
     )
 
-    val_ds = ValImageDataset(VAL_HR_DIR, max_files=val_max)
-    val_loader = DataLoader(
-        val_ds, batch_size=1, shuffle=False,
-        num_workers=0, pin_memory=(DEVICE=="cuda")
-    )
+    if args.overfit_latent_path:
+        val_ds = SingleLatentDataset(args.overfit_latent_path)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+    else:
+        val_ds = ValImageDataset(VAL_HR_DIR, max_files=val_max)
+        val_loader = DataLoader(
+            val_ds, batch_size=1, shuffle=False,
+            num_workers=0, pin_memory=(DEVICE=="cuda")
+        )
 
     print("Loading PixArt...")
     pixart = PixArtMS_XL_2(input_size=64).to(DEVICE).to(DTYPE_PIXART).train()
@@ -683,7 +806,7 @@ def main():
     pixart.load_state_dict(ckpt, strict=False)
 
     print("Loading Adapter...")
-    adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
+    adapter = build_adapter(args.adapter_type, in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
 
     optimizer = set_trainable_A(pixart, adapter)
     scaler = GradScaler(enabled=USE_AMP)
@@ -712,7 +835,7 @@ def main():
         )
 
     # 训练
-    total_epochs = (EPOCHS if not SMOKE else 1)
+    total_epochs = EPOCHS if not SMOKE else (smoke_epochs if smoke_epochs is not None else 1)
     for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
@@ -724,8 +847,8 @@ def main():
 
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
-            noise = torch.randn_like(hr_latent)
-            noisy = diffusion.q_sample(hr_latent, t, noise)
+            noise = torch.randn_like(lr_latent)
+            noisy = diffusion.q_sample(lr_latent, t, noise)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -757,7 +880,14 @@ def main():
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
 
         # 验证
-        vpsnr, vssim, vlp = validate_epoch(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn, max_vis=1)
+        if args.overfit_latent_path:
+            vpsnr, vssim, vlp = validate_overfit_latent(
+                epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn
+            )
+        else:
+            vpsnr, vssim, vlp = validate_epoch(
+                epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn, max_vis=1
+            )
         print(f"[VAL] epoch={epoch+1} PSNR={vpsnr:.2f} SSIM={vssim:.4f} LPIPS={vlp if math.isfinite(vlp) else float('nan'):.4f}")
 
         # $$ [MOD-RESUME-4] 每个 epoch 保存一份 last_full_state：保证你随时能“精确续跑”
