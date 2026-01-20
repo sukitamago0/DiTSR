@@ -98,7 +98,7 @@ RECON_LOSS_WEIGHT = 0.1
 # $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
 RECON_BASE_START = True
 # $$ [MOD-EDGE-1] 轻量边缘损失权重（提升纹理/细节，不引入额外网络）
-EDGE_LOSS_WEIGHT = 0.05
+EDGE_LOSS_WEIGHT = 0.0
 
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
@@ -813,13 +813,17 @@ def main():
                 if USE_RECON_LOSS:
                     recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
                     # $$ [MOD-EDGE-3] 轻量边缘损失（latent 空间）
-                    edge_pred = sobel_edges(recon_base.float())
-                    edge_gt = sobel_edges(hr_latent.float())
-                    edge_loss = F.l1_loss(edge_pred, edge_gt)
+                    if EDGE_LOSS_WEIGHT > 0:
+                        edge_pred = sobel_edges(recon_base.float())
+                        edge_gt = sobel_edges(hr_latent.float())
+                        edge_loss = F.l1_loss(edge_pred, edge_gt)
+                    else:
+                        edge_loss = None
                     # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
                     recon_weight = torch.exp(-adapter.recon_log_sigma.float())
                     loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
-                    loss = loss + EDGE_LOSS_WEIGHT * edge_loss
+                    if edge_loss is not None:
+                        loss = loss + EDGE_LOSS_WEIGHT * edge_loss
                 # $$ [MOD-NAN-2] 训练损失兜底，避免 NaN 使训练崩溃
                 if not torch.isfinite(loss):
                     loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -847,8 +851,9 @@ def main():
                 postfix.update({
                     "recon": f"{recon_loss.item():.4f}",
                     "recon_w": f"{recon_weight.item():.4f}",
-                    "edge": f"{edge_loss.item():.4f}",
                 })
+                if edge_loss is not None:
+                    postfix["edge"] = f"{edge_loss.item():.4f}"
             pbar.set_postfix(postfix)
 
         if accum_counter % accum_steps != 0:
