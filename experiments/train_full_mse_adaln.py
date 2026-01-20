@@ -65,17 +65,16 @@ DTYPE_PIXART = torch.float16  # PixArt 主干用 FP16 省显存
 DTYPE_LATENT = torch.float16  # 你离线 latent 就是 FP16
 USE_AMP = (DEVICE == "cuda")
 
-EPOCHS = int(os.getenv("EPOCHS_OVERRIDE", "100"))
+EPOCHS = 100
 BATCH_SIZE = 1
 NUM_WORKERS = 0
 LR_ADAPTER = 1e-5
 LR_SCALES  = 1e-4
-GRAD_ACCUM_STEPS = 2
+GRAD_ACCUM_STEPS = 1
 
 SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
 SMOKE_VAL_SAMPLES = 20
-SMOKE_EPOCHS = 1
 
 NUM_INFER_STEPS = 20
 SDE_STRENGTH = 0.45
@@ -92,14 +91,6 @@ METRIC_Y_CHANNEL = True
 # $$ [MOD-METRIC-2] 常见 SR 评估会 shave border（x4 通常=4）。如果你想“完全不裁边”，设为 0。
 METRIC_SHAVE_BORDER = 4
 
-# reconstruction branch controls
-USE_RECON_LOSS = False
-RECON_LOSS_WEIGHT = 0.1
-# $$ [MOD-RECON-START-1] 用 recon_base 作为扩散起点（与 joint_recon 思路一致）
-RECON_BASE_START = False
-# $$ [MOD-EDGE-1] 轻量边缘损失权重（提升纹理/细节，不引入额外网络）
-EDGE_LOSS_WEIGHT = 0.02
-
 # $$ [MOD-RESUME-0] 额外保存一个“last 全状态”用于可靠续跑（不参与 topK 删除）
 LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 
@@ -108,7 +99,7 @@ LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last_full_state.pth")
 # -------------------------
 try:
     from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
-    from diffusion.model.nets.adapter import build_adapter
+    from diffusion.model.nets.adapter import MultiLevelAdapter
     from diffusion import IDDPM
 except ImportError as e:
     print(f"❌ Import failed: {e}")
@@ -329,12 +320,6 @@ def set_trainable_A(pixart, adapter):
     ])
     return optimizer
 
-# $$ [MOD-INJ-1] 打印注入强度（用于对齐你在 diagnose_control_curve_full_v3.py 的强度扫描结论）
-def log_injection_scales(pixart, tag: str = "train_init"):
-    inj = [float(s.detach().float().cpu().item()) for s in getattr(pixart, "injection_scales", [])]
-    cross = float(getattr(pixart, "cross_attn_scale", torch.tensor(float("nan"))).detach().float().cpu().item())
-    print(f"🔎 [INJECT] {tag} | injection_scales={inj} | cross_attn_scale={cross}")
-
 def build_text_cond():
     y_embed = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1)
     y_embed = y_embed.to(DEVICE).to(DTYPE_PIXART)
@@ -367,30 +352,6 @@ def shave_border(x: torch.Tensor, shave: int) -> torch.Tensor:
     if shave <= 0:
         return x
     return x[..., shave:-shave, shave:-shave]
-
-# $$ [MOD-EDGE-2] Sobel 边缘算子（按 batch 计算）
-def sobel_edges(x: torch.Tensor) -> torch.Tensor:
-    # x: [B, C, H, W]
-    kernel_x = torch.tensor(
-        [[-1, 0, 1],
-         [-2, 0, 2],
-         [-1, 0, 1]],
-        dtype=x.dtype,
-        device=x.device,
-    ).view(1, 1, 3, 3)
-    kernel_y = torch.tensor(
-        [[-1, -2, -1],
-         [ 0,  0,  0],
-         [ 1,  2,  1]],
-        dtype=x.dtype,
-        device=x.device,
-    ).view(1, 1, 3, 3)
-    b, c, _, _ = x.shape
-    kx = kernel_x.repeat(c, 1, 1, 1)
-    ky = kernel_y.repeat(c, 1, 1, 1)
-    gx = F.conv2d(x, kx, padding=1, groups=c)
-    gy = F.conv2d(x, ky, padding=1, groups=c)
-    return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
 # -------------------------
 # 7) 验证：沿用你单样本的 “SDE_STRENGTH + DPMSolver” 逻辑
@@ -438,9 +399,8 @@ def validate_epoch(
             lr_img_11 = lr_img_11.to(DEVICE).float()
 
             # VAE encode（不需要梯度）
-            # $$ [MOD-VAL-1] 评估阶段使用 mode()，避免随机性影响指标
-            # $$ [MOD-VAL-3] 仅保留 lr_latent（hr_latent 在像素域评估中不再需要）
-            lr_latent = vae.encode(lr_img_11).latent_dist.mode() * vae.config.scaling_factor # [1,4,64,64] fp32
+            hr_latent = vae.encode(item_hr).latent_dist.sample() * vae.config.scaling_factor   # [1,4,64,64] fp32
+            lr_latent = vae.encode(lr_img_11).latent_dist.sample() * vae.config.scaling_factor # [1,4,64,64] fp32
 
             # 采样：严格对齐你单样本脚本的写法
             scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
@@ -451,23 +411,13 @@ def validate_epoch(
             run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
 
             g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-            # $$ [MOD-RECON-START-2] 可选：以 recon_base 作为扩散起点
-            if USE_RECON_LOSS and RECON_BASE_START:
-                _, recon_base = adapter.forward_with_recon(lr_latent.float())
-                # $$ [MOD-NAN-3] 防止 recon_base 在验证中产生 NaN/Inf
-                recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
-                latents = recon_base.to(DEVICE)
-            else:
-                latents = lr_latent.to(DEVICE)  # fp32
+            latents = lr_latent.to(DEVICE)  # fp32
             noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
             t_start = torch.tensor([start_t_val], device=DEVICE).long()
             latents = scheduler.add_noise(latents, noise, t_start)
 
             with torch.cuda.amp.autocast(enabled=False):
-                if USE_RECON_LOSS and RECON_BASE_START:
-                    cond, _ = adapter.forward_with_recon(lr_latent.float())
-                else:
-                    cond = adapter(lr_latent.float())  # fp32 list
+                cond = adapter(lr_latent.float())  # fp32 list
 
             for t in run_ts:
                 t_tensor = t.unsqueeze(0).to(DEVICE)
@@ -488,8 +438,8 @@ def validate_epoch(
             pred_img = vae.decode(latents / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
-            # $$ [MOD-VAL-2] 指标改为像素域 GT（HR 原图），符合 SR 评估规范
-            gt_img_01 = torch.clamp((item_hr + 1.0) / 2.0, 0.0, 1.0)
+            gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
+            gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
 
             lr_img_01 = torch.clamp((lr_img_11 + 1.0) / 2.0, 0.0, 1.0)
 
@@ -702,19 +652,15 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
-    parser.add_argument("--smoke_train", type=int, default=SMOKE_TRAIN_SAMPLES, help="override smoke train samples")
-    parser.add_argument("--smoke_val", type=int, default=SMOKE_VAL_SAMPLES, help="override smoke val samples")
-    parser.add_argument("--smoke_epochs", type=int, default=SMOKE_EPOCHS, help="override smoke epochs")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
-    parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
     args = parser.parse_args()
     SMOKE = bool(args.smoke)
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
-    train_max = args.smoke_train if SMOKE else None
-    val_max   = args.smoke_val if SMOKE else None
+    train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
+    val_max   = SMOKE_VAL_SAMPLES if SMOKE else None
 
     train_ds = TrainLatentDataset(TRAIN_LATENT_DIR, max_files=train_max)
     train_loader = DataLoader(
@@ -737,10 +683,9 @@ def main():
     pixart.load_state_dict(ckpt, strict=False)
 
     print("Loading Adapter...")
-    adapter = build_adapter(args.adapter_type, in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
+    adapter = MultiLevelAdapter(in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
 
     optimizer = set_trainable_A(pixart, adapter)
-    log_injection_scales(pixart, tag="after_set_trainable_A")
     scaler = GradScaler(enabled=USE_AMP)
 
     diffusion = IDDPM(str(1000))
@@ -767,33 +712,25 @@ def main():
         )
 
     # 训练
-    total_epochs = (EPOCHS if not SMOKE else int(args.smoke_epochs))
+    total_epochs = (EPOCHS if not SMOKE else 1)
     for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
         pbar = tqdm(train_loader, desc=f"Train Ep{epoch+1}", dynamic_ncols=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        accum_steps = max(1, int(GRAD_ACCUM_STEPS))
-        accum_counter = 0
         for batch in pbar:
             hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
             lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
 
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
-            with torch.cuda.amp.autocast(enabled=False):
-                if USE_RECON_LOSS:
-                    cond, recon_base = adapter.forward_with_recon(lr_latent.float())
-                    # $$ [MOD-NAN-1] 防止 recon_base 出现 NaN/Inf 传播到扩散起点
-                    recon_base = torch.nan_to_num(recon_base.float(), nan=0.0, posinf=0.0, neginf=0.0)
-                else:
-                    cond = adapter(lr_latent.float())
-                    recon_base = None
             noise = torch.randn_like(hr_latent)
-            # $$ [MOD-RECON-START-3] 训练时用 recon_base 作为扩散起点，减少训练/推理分布偏移
-            noisy_start = recon_base if (USE_RECON_LOSS and RECON_BASE_START) else hr_latent
-            noisy = diffusion.q_sample(noisy_start, t, noise)
+            noisy = diffusion.q_sample(hr_latent, t, noise)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                cond = adapter(lr_latent.float())
 
             with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=DTYPE_PIXART):
                 out = pixart(
@@ -807,69 +744,17 @@ def main():
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
-                recon_loss = None
-                recon_weight = None
-                edge_loss = None
-                if USE_RECON_LOSS:
-                    recon_loss = F.l1_loss(recon_base.float(), hr_latent.float())
-                    # $$ [MOD-EDGE-3] 轻量边缘损失（latent 空间）
-                    if EDGE_LOSS_WEIGHT > 0:
-                        edge_pred = sobel_edges(recon_base.float())
-                        edge_gt = sobel_edges(hr_latent.float())
-                        edge_loss = F.l1_loss(edge_pred, edge_gt)
-                    else:
-                        edge_loss = None
-                    # $$ [MOD-RECON-WEIGHT-1] 可学习的不确定性权重（Kendall 多任务加权）
-                    recon_weight = torch.exp(-adapter.recon_log_sigma.float())
-                    loss = loss + RECON_LOSS_WEIGHT * (recon_weight * recon_loss + adapter.recon_log_sigma.float())
-                    if edge_loss is not None:
-                        loss = loss + EDGE_LOSS_WEIGHT * edge_loss
-                elif EDGE_LOSS_WEIGHT > 0:
-                    # $$ [MOD-EDGE-4] 纯 MSE 路径：对 pred_x0 做轻量边缘约束
-                    pred_x0 = diffusion._predict_xstart_from_eps(x_t=noisy, t=t, eps=out.float())
-                    edge_pred = sobel_edges(pred_x0.float())
-                    edge_gt = sobel_edges(hr_latent.float())
-                    edge_loss = F.l1_loss(edge_pred, edge_gt)
-                    loss = loss + EDGE_LOSS_WEIGHT * edge_loss
-                # $$ [MOD-NAN-2] 训练损失兜底，避免 NaN 使训练崩溃
-                if not torch.isfinite(loss):
-                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
             if USE_AMP:
-                scaler.scale(loss / accum_steps).backward()
-            else:
-                (loss / accum_steps).backward()
-
-            accum_counter += 1
-            if accum_counter % accum_steps == 0:
-                if USE_AMP:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            global_step += 1
-            postfix = {
-                "loss": f"{loss.item():.4f}",
-                "seen": global_step,
-            }
-            if USE_RECON_LOSS:
-                postfix.update({
-                    "recon": f"{recon_loss.item():.4f}",
-                    "recon_w": f"{recon_weight.item():.4f}",
-                })
-            if edge_loss is not None:
-                postfix["edge"] = f"{edge_loss.item():.4f}"
-            pbar.set_postfix(postfix)
-
-        if accum_counter % accum_steps != 0:
-            if USE_AMP:
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                loss.backward()
                 optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+
+            global_step += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
 
         # 验证
         vpsnr, vssim, vlp = validate_epoch(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn, max_vis=1)
