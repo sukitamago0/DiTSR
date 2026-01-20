@@ -47,6 +47,22 @@ except ImportError:
     USE_METRICS = False
 
 
+def ensure_fp32_inject_modules(pixart):
+    if hasattr(pixart, "injection_scales"):
+        for s in pixart.injection_scales:
+            s.data = s.data.float()
+    if hasattr(pixart, "adapter_proj"):
+        pixart.adapter_proj = pixart.adapter_proj.to(torch.float32)
+    if hasattr(pixart, "adapter_norm"):
+        pixart.adapter_norm = pixart.adapter_norm.to(torch.float32)
+    if hasattr(pixart, "cross_attn_scale"):
+        pixart.cross_attn_scale.data = pixart.cross_attn_scale.data.float()
+    if hasattr(pixart, "input_adapter_ln"):
+        pixart.input_adapter_ln = pixart.input_adapter_ln.to(torch.float32)
+    if hasattr(pixart, "input_adaln"):
+        pixart.input_adaln = pixart.input_adaln.to(torch.float32)
+
+
 def load_ckpt(pixart, adapter, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     if "adapter" in ckpt:
@@ -181,6 +197,7 @@ def main():
     if "pos_embed" in ckpt:
         del ckpt["pos_embed"]
     pixart.load_state_dict(ckpt, strict=False)
+    ensure_fp32_inject_modules(pixart)
 
     adapter = build_adapter(args.adapter_type, in_channels=4, hidden_size=1152).to(DEVICE).eval()
     load_ckpt(pixart, adapter, args.ckpt)
