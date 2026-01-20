@@ -535,7 +535,8 @@ def validate_overfit_latent(
         run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
 
         g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-        latents = lr_latent.to(DEVICE)
+        # 过拟合验证应与训练分布一致：主干从 HR latent 加噪开始
+        latents = hr_latent.to(DEVICE)
         noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
         t_start = torch.tensor([start_t_val], device=DEVICE).long()
         latents = scheduler.add_noise(latents, noise, t_start)
