@@ -211,3 +211,7 @@ def build_adapter(adapter_type: str, in_channels: int = 4, hidden_size: int = 11
     if adapter_type == "fpn_se":
         return MultiLevelAdapterSE(in_channels=in_channels, hidden_size=hidden_size)
     raise ValueError(f"Unknown adapter_type={adapter_type}")
+
+
+# Backward compatibility: older training scripts import MultiLevelAdapter directly.
+MultiLevelAdapter = MultiLevelAdapterFPN
