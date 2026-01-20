@@ -115,20 +115,25 @@ def run_epoch(mode: str, pixart, adapter, vae, dl, y_embed, data_info, lpips_fn=
                 pred_img = vae.decode(recon_base / vae.config.scaling_factor).sample
                 pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
             else:
+                use_recon_init = (mode == "joint_recon")
                 scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
                 scheduler.set_timesteps(NUM_INFER_STEPS, device=DEVICE)
                 start_t_val = int(1000 * SDE_STRENGTH)
                 run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
 
                 g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-                latents = lr_latent.to(DEVICE)
+                if use_recon_init:
+                    _, recon_base = adapter.forward_with_recon(lr_latent.float())
+                    latents = recon_base.to(DEVICE)
+                else:
+                    latents = lr_latent.to(DEVICE)
                 noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
                 t_start = torch.tensor([start_t_val], device=DEVICE).long()
                 latents = scheduler.add_noise(latents, noise, t_start)
 
                 with torch.cuda.amp.autocast(enabled=False):
                     cond = None
-                    if mode == "joint":
+                    if mode in {"joint", "joint_recon"}:
                         cond, _ = adapter.forward_with_recon(lr_latent.float())
                         cond = [feat.float() for feat in cond]
 
@@ -187,7 +192,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="adapter+pixart_inject checkpoint")
     parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
-    parser.add_argument("--mode", type=str, default="all", choices=["all", "joint", "pixart_only", "adapter_only"])
+    parser.add_argument("--mode", type=str, default="all", choices=["all", "joint", "joint_recon", "pixart_only", "adapter_only"])
     parser.add_argument("--max_samples", type=int, default=20)
     args = parser.parse_args()
 
@@ -219,7 +224,7 @@ def main():
     dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
     print(f"[INFO] VAL_DEGRADE_MODE={VAL_DEGRADE_MODE} | samples={len(val_ds)}")
 
-    modes = ["joint", "pixart_only", "adapter_only"] if args.mode == "all" else [args.mode]
+    modes = ["joint", "joint_recon", "pixart_only", "adapter_only"] if args.mode == "all" else [args.mode]
     for mode in modes:
         p, s, l = run_epoch(mode, pixart, adapter, vae, dl, y_embed, data_info, lpips_fn)
         print(f"[{mode}] PSNR={p:.2f} SSIM={s:.4f} LPIPS={l if math.isfinite(l) else float('nan'):.4f}")
