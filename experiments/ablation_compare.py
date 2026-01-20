@@ -28,6 +28,7 @@ from experiments.train_full_mse_adaln import (
     VAE_PATH,
     PIXART_PATH,
     T5_EMBED_PATH,
+    VAL_HR_DIR,
     ValImageDataset,
     degrade_hr_to_lr_tensor,
     rgb01_to_y01,
@@ -213,8 +214,10 @@ def main():
         for p in lpips_fn.parameters():
             p.requires_grad = False
 
-    val_ds = ValImageDataset(os.path.join(os.path.dirname(__file__), "..", "dataset", "DIV2K_valid_HR"), max_files=args.max_samples)
+    max_files = args.max_samples if args.max_samples > 0 else None
+    val_ds = ValImageDataset(VAL_HR_DIR, max_files=max_files)
     dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
+    print(f"[INFO] VAL_DEGRADE_MODE={VAL_DEGRADE_MODE} | samples={len(val_ds)}")
 
     modes = ["joint", "pixart_only", "adapter_only"] if args.mode == "all" else [args.mode]
     for mode in modes:
