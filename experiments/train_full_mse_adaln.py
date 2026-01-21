@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # experiments/train_full_mse.py
 import os
 import sys
