@@ -736,6 +736,8 @@ def try_resume(
 # -------------------------
 def main():
     global SMOKE
+    global SMOKE_TRAIN_SAMPLES
+    global SMOKE_VAL_SAMPLES
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="run smoke: 20 train + 20 val with full logic")
