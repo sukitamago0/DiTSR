@@ -221,7 +221,12 @@ def degrade_hr_to_lr_tensor(
         if torch_gen is None:
             eps = torch.randn_like(lr_small)
         else:
-            eps = torch.randn_like(lr_small, generator=torch_gen)
+            eps = torch.randn(
+                lr_small.shape,
+                generator=torch_gen,
+                device=lr_small.device,
+                dtype=lr_small.dtype,
+            )
         lr_small = (lr_small + eps * noise_std).clamp(-1, 1)
 
     jpeg_q = rng.randint(30, 95)
