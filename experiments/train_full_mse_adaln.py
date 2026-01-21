@@ -21,6 +21,7 @@ from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
 from torch.cuda.amp import GradScaler
 
 import numpy as np  # $$ [MOD-IMG-1] 用 np.asarray(pil) 读取图片，避免 TypedStorage 警告且更标准
+from torchvision.transforms import functional as TF
 
 # -------------------------
 # 0) 环境硬约束（你自己一直在用）
@@ -77,7 +78,6 @@ SMOKE_TRAIN_SAMPLES = 20
 SMOKE_VAL_SAMPLES = 20
 
 NUM_INFER_STEPS = 20
-SDE_STRENGTH = 0.45
 FIXED_NOISE_SEED = 42
 
 VAL_DEGRADE_MODE = "realistic"  # "realistic" / "bicubic"
@@ -169,21 +169,18 @@ def pil_to_tensor_norm01(pil: Image.Image) -> torch.Tensor:
 def norm01_to_norm11(x01: torch.Tensor) -> torch.Tensor:
     return x01 * 2.0 - 1.0
 
-def transforms_to_pil(x01: torch.Tensor) -> Image.Image:
-    x = (x01.clamp(0,1) * 255.0).byte().permute(1,2,0).cpu().numpy()
-    return Image.fromarray(x)
-
 def _jpeg_compress_tensor(x11: torch.Tensor, quality: int) -> torch.Tensor:
-    x = x11.clamp(-1,1)
-    x01 = (x + 1.0) / 2.0
-    x01 = x01.cpu()
-    pil = transforms_to_pil(x01)
+    # 与离线 latent 生成保持一致（TF.to_pil_image + TF.to_tensor）
+    img = x11.clamp(-1.0, 1.0)
+    img = (img + 1.0) / 2.0
+    img = TF.to_pil_image(img)
     buffer = io.BytesIO()
-    pil.save(buffer, format="JPEG", quality=int(quality))
+    img.save(buffer, format="JPEG", quality=int(quality))
     buffer.seek(0)
-    pil2 = Image.open(buffer).convert("RGB")
-    x01b = pil_to_tensor_norm01(pil2)
-    return norm01_to_norm11(x01b)
+    img = Image.open(buffer).convert("RGB")
+    img = TF.to_tensor(img)
+    img = (img * 2.0) - 1.0
+    return img
 
 def center_crop(pil: Image.Image, size: int = 512) -> Image.Image:
     w, h = pil.size
@@ -193,18 +190,6 @@ def center_crop(pil: Image.Image, size: int = 512) -> Image.Image:
     left = (w - size) // 2
     top  = (h - size) // 2
     return pil.crop((left, top, left + size, top + size))
-
-def gaussian_kernel2d(k: int, sigma: float, device, dtype):
-    ax = torch.arange(k, device=device, dtype=dtype) - (k - 1) / 2.0
-    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-    kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-    kernel = kernel / kernel.sum()
-    return kernel
-
-def depthwise_conv2d(x: torch.Tensor, kernel2d: torch.Tensor) -> torch.Tensor:
-    k = kernel2d.shape[0]
-    w = kernel2d.view(1,1,k,k).repeat(3,1,1,1)
-    return F.conv2d(x, w, padding=k//2, groups=3)
 
 def degrade_hr_to_lr_tensor(
     hr11: torch.Tensor,
@@ -222,29 +207,27 @@ def degrade_hr_to_lr_tensor(
         lr = F.interpolate(lr_small, size=(512,512), mode="bicubic", align_corners=False)
         return lr.squeeze(0)
 
-    blur_k = rng.choice([3,5,7])
+    blur_k = rng.choice([3, 5, 7])
     blur_sigma = rng.uniform(0.2, 1.2)
 
     hr = hr11.unsqueeze(0)
-    kernel = gaussian_kernel2d(blur_k, blur_sigma, device=hr.device, dtype=hr.dtype)
-    hr_blur = depthwise_conv2d(hr, kernel)
+    hr_blur = TF.gaussian_blur(hr.squeeze(0), blur_k, [blur_sigma, blur_sigma]).unsqueeze(0)
 
     lr_small = F.interpolate(hr_blur, scale_factor=0.25, mode="bicubic", align_corners=False)
 
     noise_std = rng.uniform(0.0, 0.02)
     if noise_std > 0:
-        # $$ [MOD-SEED-2] 用 torch_gen 采样噪声，保证每张图的退化可复现（否则每天都会抖）
         if torch_gen is None:
-            eps = torch.randn(lr_small.shape, device=lr_small.device, dtype=lr_small.dtype)
+            eps = torch.randn_like(lr_small)
         else:
-            eps = torch.randn(lr_small.shape, generator=torch_gen, device=lr_small.device, dtype=lr_small.dtype)
-        lr_small = (lr_small + eps * noise_std).clamp(-1,1)
+            eps = torch.randn_like(lr_small, generator=torch_gen)
+        lr_small = (lr_small + eps * noise_std).clamp(-1, 1)
 
     jpeg_q = rng.randint(30, 95)
     lr_small_cpu = lr_small.squeeze(0).cpu()
     lr_small_cpu = _jpeg_compress_tensor(lr_small_cpu, jpeg_q).unsqueeze(0)
 
-    lr = F.interpolate(lr_small_cpu, size=(512,512), mode="bicubic", align_corners=False)
+    lr = F.interpolate(lr_small_cpu, size=(512, 512), mode="bicubic", align_corners=False)
     return lr.squeeze(0)
 
 class ValImageDataset(Dataset):
@@ -370,7 +353,7 @@ def shave_border(x: torch.Tensor, shave: int) -> torch.Tensor:
     return x[..., shave:-shave, shave:-shave]
 
 # -------------------------
-# 7) 验证：沿用你单样本的 “SDE_STRENGTH + DPMSolver” 逻辑
+# 7) 验证：方案B（从纯噪声开始）+ DPMSolver
 # -------------------------
 @torch.no_grad()
 def validate_epoch(
@@ -422,15 +405,11 @@ def validate_epoch(
             scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
             scheduler.set_timesteps(NUM_INFER_STEPS, device=DEVICE)
 
-            start_t_val = int(1000 * SDE_STRENGTH)
-            # 这里保持“过滤 timesteps”的方式（与你单样本一致）
-            run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
+            # 方案B：主干学习 HR latent 的去噪分布，推理从纯噪声开始
+            run_ts = list(scheduler.timesteps)
 
             g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-            latents = lr_latent.to(DEVICE)  # fp32
-            noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
-            t_start = torch.tensor([start_t_val], device=DEVICE).long()
-            latents = scheduler.add_noise(latents, noise, t_start)
+            latents = torch.randn(lr_latent.shape, generator=g, device=DEVICE, dtype=lr_latent.dtype)
 
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())  # fp32 list
@@ -531,15 +510,11 @@ def validate_overfit_latent(
 
         scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, solver_order=2)
         scheduler.set_timesteps(NUM_INFER_STEPS, device=DEVICE)
-        start_t_val = int(1000 * SDE_STRENGTH)
-        run_ts = [t for t in scheduler.timesteps if t <= start_t_val]
+        # 方案B：主干学习 HR latent 的去噪分布，推理从纯噪声开始
+        run_ts = list(scheduler.timesteps)
 
         g = torch.Generator(device=DEVICE).manual_seed(FIXED_NOISE_SEED)
-        # 过拟合验证与训练保持一致：主干从 LR latent 加噪开始
-        latents = lr_latent.to(DEVICE)
-        noise = torch.randn(latents.shape, generator=g, device=DEVICE, dtype=latents.dtype)
-        t_start = torch.tensor([start_t_val], device=DEVICE).long()
-        latents = scheduler.add_noise(latents, noise, t_start)
+        latents = torch.randn(lr_latent.shape, generator=g, device=DEVICE, dtype=lr_latent.dtype)
 
         with torch.cuda.amp.autocast(enabled=False):
             cond = adapter(lr_latent.float())
@@ -847,8 +822,8 @@ def main():
 
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
-            noise = torch.randn_like(lr_latent)
-            noisy = diffusion.q_sample(lr_latent, t, noise)
+            noise = torch.randn_like(hr_latent)
+            noisy = diffusion.q_sample(hr_latent, t, noise)
 
             optimizer.zero_grad(set_to_none=True)
 
