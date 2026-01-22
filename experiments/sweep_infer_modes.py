@@ -132,7 +132,7 @@ def eval_mode(
 
         # deterministic per-image degradation (aligned with validation)
         rng = np.random.RandomState(tfa.stable_int_hash(name, mod=2**32))
-        torch_gen = torch.Generator(device=tfa.DEVICE).manual_seed(
+        torch_gen = torch.Generator(device="cpu").manual_seed(
             tfa.stable_int_hash(name, mod=2**31)
         )
 
