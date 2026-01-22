@@ -212,6 +212,7 @@ def degrade_hr_to_lr_tensor(
     blur_sigma = rng.uniform(0.2, 1.2)
 
     hr = hr11.unsqueeze(0)
+    blur_k = int(blur_k)
     hr_blur = TF.gaussian_blur(hr.squeeze(0), blur_k, [blur_sigma, blur_sigma]).unsqueeze(0)
 
     lr_small = F.interpolate(hr_blur, scale_factor=0.25, mode="bicubic", align_corners=False)
