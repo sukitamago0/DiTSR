@@ -13,10 +13,14 @@ with the validation degradation and metrics.
 import argparse
 import math
 import os
+import sys
 
 import numpy as np
 import torch
 from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(PROJECT_ROOT)
 
 from experiments import train_full_mse_adaln as tfa
 
