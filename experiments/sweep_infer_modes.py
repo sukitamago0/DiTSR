@@ -13,6 +13,7 @@ with the validation degradation and metrics.
 import argparse
 import math
 import os
+import random
 import sys
 
 import numpy as np
@@ -27,6 +28,56 @@ from experiments import train_full_mse_adaln as tfa
 
 def parse_strengths(text: str):
     return [float(x.strip()) for x in text.split(",") if x.strip()]
+
+def degrade_hr_to_lr_tensor(
+    hr11: torch.Tensor,
+    mode: str,
+    rng: random.Random,
+    torch_gen: torch.Generator = None,
+) -> torch.Tensor:
+    if mode == "bicubic":
+        hr = hr11.unsqueeze(0)
+        lr_small = torch.nn.functional.interpolate(
+            hr, scale_factor=0.25, mode="bicubic", align_corners=False
+        )
+        lr = torch.nn.functional.interpolate(
+            lr_small, size=(512, 512), mode="bicubic", align_corners=False
+        )
+        return lr.squeeze(0)
+
+    blur_k = int(rng.choice([3, 5, 7]))
+    blur_sigma = rng.uniform(0.2, 1.2)
+
+    hr = hr11.unsqueeze(0)
+    hr_blur = tfa.TF.gaussian_blur(
+        hr.squeeze(0), blur_k, [blur_sigma, blur_sigma]
+    ).unsqueeze(0)
+
+    lr_small = torch.nn.functional.interpolate(
+        hr_blur, scale_factor=0.25, mode="bicubic", align_corners=False
+    )
+
+    noise_std = rng.uniform(0.0, 0.02)
+    if noise_std > 0:
+        if torch_gen is None:
+            eps = torch.randn_like(lr_small)
+        else:
+            eps = torch.randn(
+                lr_small.shape,
+                generator=torch_gen,
+                device=lr_small.device,
+                dtype=lr_small.dtype,
+            )
+        lr_small = (lr_small + eps * noise_std).clamp(-1, 1)
+
+    jpeg_q = rng.randint(30, 95)
+    lr_small_cpu = lr_small.squeeze(0).cpu()
+    lr_small_cpu = tfa._jpeg_compress_tensor(lr_small_cpu, jpeg_q).unsqueeze(0)
+
+    lr = torch.nn.functional.interpolate(
+        lr_small_cpu, size=(512, 512), mode="bicubic", align_corners=False
+    )
+    return lr.squeeze(0)
 
 
 def load_models(ckpt_path: str, adapter_type: str):
@@ -85,7 +136,7 @@ def eval_mode(
             tfa.stable_int_hash(name, mod=2**31)
         )
 
-        lr_img_11 = tfa.degrade_hr_to_lr_tensor(
+        lr_img_11 = degrade_hr_to_lr_tensor(
             hr11.detach().cpu(),
             tfa.VAL_DEGRADE_MODE,
             rng,

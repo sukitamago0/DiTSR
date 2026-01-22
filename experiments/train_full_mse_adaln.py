@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # experiments/train_full_mse.py
 import os
 import sys
@@ -72,7 +71,7 @@ BATCH_SIZE = 1
 NUM_WORKERS = 0
 LR_ADAPTER = 1e-5
 LR_SCALES  = 1e-4
-GRAD_ACCUM_STEPS = 1
+GRAD_ACCUM_STEPS = 4
 
 SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
@@ -208,11 +207,10 @@ def degrade_hr_to_lr_tensor(
         lr = F.interpolate(lr_small, size=(512,512), mode="bicubic", align_corners=False)
         return lr.squeeze(0)
 
-    blur_k = int(rng.choice([3, 5, 7]))
+    blur_k = rng.choice([3, 5, 7])
     blur_sigma = rng.uniform(0.2, 1.2)
 
     hr = hr11.unsqueeze(0)
-    blur_k = int(blur_k)
     hr_blur = TF.gaussian_blur(hr.squeeze(0), blur_k, [blur_sigma, blur_sigma]).unsqueeze(0)
 
     lr_small = F.interpolate(hr_blur, scale_factor=0.25, mode="bicubic", align_corners=False)
