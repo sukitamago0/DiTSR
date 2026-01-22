@@ -89,7 +89,12 @@ def load_models(ckpt_path: str, adapter_type: str):
         del ckpt["pos_embed"]
     pixart.load_state_dict(ckpt, strict=False)
 
-    adapter = tfa.build_adapter(adapter_type, in_channels=4, hidden_size=1152).to(tfa.DEVICE).eval()
+    adapter = (
+        tfa.build_adapter(adapter_type, in_channels=4, hidden_size=1152)
+        .to(tfa.DEVICE)
+        .to(torch.float32)
+        .eval()
+    )
 
     state = torch.load(ckpt_path, map_location="cpu")
     if "adapter" not in state:
@@ -171,6 +176,10 @@ def eval_mode(
 
         with torch.cuda.amp.autocast(enabled=False):
             cond = adapter(lr_latent.float())
+            if isinstance(cond, list):
+                cond = [c.float() for c in cond]
+            else:
+                cond = cond.float()
 
         for t in run_ts:
             t_tensor = t.unsqueeze(0).to(tfa.DEVICE)
