@@ -72,6 +72,7 @@ NUM_WORKERS = 0
 LR_ADAPTER = 1e-5
 LR_SCALES  = 1e-4
 GRAD_ACCUM_STEPS = 4
+LR_UNFREEZE = 5e-6
 
 SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
@@ -261,7 +262,7 @@ class ValImageDataset(Dataset):
 # -------------------------
 # 6) 只训练 A：Adapter + (PixArt 注入相关小模块)
 # -------------------------
-def set_trainable_A(pixart, adapter):
+def set_trainable_A(pixart, adapter, unfreeze_blocks: int = 0):
     for p in pixart.parameters():
         p.requires_grad = False
 
@@ -309,18 +310,31 @@ def set_trainable_A(pixart, adapter):
             proj_params.append(p)
 
     adapter_params = list(adapter.parameters())
+    extra_params = []
+    if unfreeze_blocks > 0 and hasattr(pixart, "blocks"):
+        blocks = pixart.blocks
+        if unfreeze_blocks > len(blocks):
+            raise ValueError(f"unfreeze_blocks={unfreeze_blocks} exceeds depth={len(blocks)}")
+        for blk in list(blocks)[-unfreeze_blocks:]:
+            for p in blk.parameters():
+                p.requires_grad = True
+                if p.dtype != torch.float32:
+                    p.data = p.data.float()
+                extra_params.append(p)
 
     for pp in (adapter_params + proj_params + scale_params):
         if pp.dtype != torch.float32:
             raise ValueError(f"Trainable param is not fp32: dtype={pp.dtype}")
 
     print(f"🔥 Trainable: Adapter({sum(p.numel() for p in adapter_params)}) | "
-          f"Proj/LN({len(proj_params)}) | Scales({len(scale_params)})")
+          f"Proj/LN({len(proj_params)}) | Scales({len(scale_params)}) | "
+          f"UnfrozenBlocks({len(extra_params)})")
 
     optimizer = torch.optim.AdamW([
         {"params": adapter_params, "lr": LR_ADAPTER},
         {"params": proj_params,    "lr": LR_ADAPTER},
         {"params": scale_params,   "lr": LR_SCALES},
+        {"params": extra_params,   "lr": LR_UNFREEZE},
     ])
     return optimizer
 
@@ -746,6 +760,9 @@ def main():
     parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
     parser.add_argument("--overfit_latent_path", type=str, default=None, help="use one latent file for strict overfit train+val")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
+    parser.add_argument("--grad_accum_steps", type=int, default=GRAD_ACCUM_STEPS, help="gradient accumulation steps")
+    parser.add_argument("--unfreeze_blocks", type=int, default=0, help="unfreeze last N PixArt blocks (0 keeps backbone frozen)")
+    parser.add_argument("--lr_unfreeze", type=float, default=LR_UNFREEZE, help="lr for unfrozen PixArt blocks")
     args = parser.parse_args()
     SMOKE = bool(args.smoke)
     if args.smoke_train is not None:
@@ -753,6 +770,9 @@ def main():
     if args.smoke_val is not None:
         SMOKE_VAL_SAMPLES = int(args.smoke_val)
     smoke_epochs = int(args.smoke_epochs) if args.smoke_epochs is not None else None
+    grad_accum_steps = max(1, int(args.grad_accum_steps))
+    global LR_UNFREEZE
+    LR_UNFREEZE = float(args.lr_unfreeze)
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
@@ -790,7 +810,7 @@ def main():
     print("Loading Adapter...")
     adapter = build_adapter(args.adapter_type, in_channels=4, hidden_size=1152).to(DEVICE).train()  # FP32
 
-    optimizer = set_trainable_A(pixart, adapter)
+    optimizer = set_trainable_A(pixart, adapter, unfreeze_blocks=int(args.unfreeze_blocks))
     scaler = GradScaler(enabled=USE_AMP)
 
     diffusion = IDDPM(str(1000))
@@ -823,7 +843,8 @@ def main():
         adapter.train()
         pbar = tqdm(train_loader, desc=f"Train Ep{epoch+1}", dynamic_ncols=True)
 
-        for batch in pbar:
+        optimizer.zero_grad(set_to_none=True)
+        for step_idx, batch in enumerate(pbar):
             hr_latent = batch["hr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
             lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE_LATENT)  # [B,4,64,64] fp16
 
@@ -832,7 +853,8 @@ def main():
             noise = torch.randn_like(hr_latent)
             noisy = diffusion.q_sample(hr_latent, t, noise)
 
-            optimizer.zero_grad(set_to_none=True)
+            if step_idx % grad_accum_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())
@@ -849,17 +871,28 @@ def main():
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
                 loss = F.mse_loss(out.float(), noise.float())
+                loss = loss / float(grad_accum_steps)
 
             if USE_AMP:
                 scaler.scale(loss).backward()
+                if (step_idx + 1) % grad_accum_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+            else:
+                loss.backward()
+                if (step_idx + 1) % grad_accum_steps == 0:
+                    optimizer.step()
+
+            if (step_idx + 1) % grad_accum_steps == 0:
+                global_step += 1
+            pbar.set_postfix({"loss": f"{(loss.item() * grad_accum_steps):.4f}", "seen": global_step})
+
+        if (step_idx + 1) % grad_accum_steps != 0:
+            if USE_AMP:
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 optimizer.step()
-
-            global_step += 1
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "seen": global_step})
 
         # 验证
         if args.overfit_latent_path:
