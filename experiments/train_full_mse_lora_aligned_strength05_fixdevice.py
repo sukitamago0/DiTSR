@@ -771,6 +771,7 @@ def validate_epoch(
     data_info,
     diffusion,
     infer_strength: float,
+    residual_mode: bool = False,
     lpips_fn=None,
     max_vis: int = 1,
 ):
@@ -809,10 +810,13 @@ def validate_epoch(
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())
 
-            # $$ [MOD-SCHEDULE-4] img2img-style init: start from lr_latent + noise(strength)
+            # $$ [MOD-SCHEDULE-4] img2img-style init:
+            # - default: start from lr_latent + noise(strength)
+            # - residual: start from zero delta + noise(strength), then add lr_latent back at the end
+            init_latent = torch.zeros_like(lr_latent) if residual_mode else lr_latent
             latents, run_ts = prepare_img2img_latents(
                 scheduler,
-                lr_latent.to(dtype=torch.float32),
+                init_latent.to(dtype=torch.float32),
                 strength=infer_strength,
                 noise_seed=FIXED_NOISE_SEED,
             )
@@ -833,7 +837,8 @@ def validate_epoch(
                         out, _ = out.chunk(2, dim=1)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-            pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+            pred_latent = latents + lr_latent if residual_mode else latents
+            pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
             gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -900,6 +905,7 @@ def validate_overfit_latent(
     data_info,
     diffusion,
     infer_strength: float,
+    residual_mode: bool = False,
     lpips_fn=None,
 ):
     pixart.eval()
@@ -912,13 +918,15 @@ def validate_overfit_latent(
     for batch in pbar:
         hr_latent = batch["hr_latent"].to(DEVICE).to(torch.float32)
         lr_latent = batch["lr_latent"].to(DEVICE).to(torch.float32)
+        base_latent = lr_latent if residual_mode else None
 
         with torch.cuda.amp.autocast(enabled=False):
             cond = adapter(lr_latent.float())
 
+        init_latent = torch.zeros_like(lr_latent) if residual_mode else lr_latent
         latents, run_ts = prepare_img2img_latents(
             scheduler,
-            lr_latent,
+            init_latent,
             strength=infer_strength,
             noise_seed=FIXED_NOISE_SEED,
         )
@@ -938,7 +946,8 @@ def validate_overfit_latent(
                     out, _ = out.chunk(2, dim=1)
             latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-        pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+        pred_latent = latents + base_latent if residual_mode else latents
+        pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
         pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
         gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -997,6 +1006,11 @@ def main():
     # $$ [MOD-LORA-6] expose LoRA LR and inference strength (minimal knobs for smoke)
     parser.add_argument("--lr_lora", type=float, default=LR_LORA, help="lr for LoRA params")
     parser.add_argument("--infer_strength", type=float, default=INFER_STRENGTH, help="DDIM img2img strength in validation (0..1)")
+    parser.add_argument(
+        "--residual_mode",
+        action="store_true",
+        help="train model to predict delta (hr_latent - lr_latent) instead of full HR latent",
+    )
     args = parser.parse_args()
 
     SMOKE = bool(args.smoke)
@@ -1009,8 +1023,10 @@ def main():
     LR_UNFREEZE = float(args.lr_unfreeze)
     LR_LORA = float(args.lr_lora)
     INFER_STRENGTH = float(args.infer_strength)
+    residual_mode = bool(args.residual_mode)
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
+    print(f"[Config] residual_mode={residual_mode}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
     train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
@@ -1101,7 +1117,8 @@ def main():
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             noise = torch.randn_like(hr_latent)
-            noisy = diffusion.q_sample(hr_latent, t, noise)
+            target_latent = hr_latent - lr_latent if residual_mode else hr_latent
+            noisy = diffusion.q_sample(target_latent, t, noise)
 
             if step_idx % grad_accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
@@ -1147,12 +1164,12 @@ def main():
         if args.overfit_latent_path:
             vpsnr, vssim, vlp = validate_overfit_latent(
                 epoch, pixart, adapter, vae, val_loader, y_embed, data_info,
-                diffusion=diffusion, infer_strength=INFER_STRENGTH, lpips_fn=lpips_fn
+                diffusion=diffusion, infer_strength=INFER_STRENGTH, residual_mode=residual_mode, lpips_fn=lpips_fn
             )
         else:
             vpsnr, vssim, vlp = validate_epoch(
                 epoch, pixart, adapter, vae, val_loader, y_embed, data_info,
-                diffusion=diffusion, infer_strength=INFER_STRENGTH, lpips_fn=lpips_fn, max_vis=1
+                diffusion=diffusion, infer_strength=INFER_STRENGTH, residual_mode=residual_mode, lpips_fn=lpips_fn, max_vis=1
             )
         print(f"[VAL] epoch={epoch+1} PSNR={vpsnr:.2f} SSIM={vssim:.4f} LPIPS={vlp if math.isfinite(vlp) else float('nan'):.4f}")
 
