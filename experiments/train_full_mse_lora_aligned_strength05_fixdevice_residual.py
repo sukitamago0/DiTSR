@@ -103,6 +103,7 @@ VAL_DEGRADE_MODE = "realistic"  # "realistic" / "bicubic"
 # $$ [MOD-SCHEDULE-2] inference strength (0..1), default 0.5 as you requested
 INFER_STRENGTH = 0.5
 RESIDUAL_MODE = True
+RESIDUAL_X0_L1_WEIGHT = 0.1
 
 PSNR_SWITCH = 24.0
 KEEP_LAST_EPOCHS = 3
@@ -120,6 +121,7 @@ try:
     from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
     from diffusion.model.nets.adapter import build_adapter
     from diffusion import IDDPM
+    from diffusion.model.gaussian_diffusion import _extract_into_tensor
 except ImportError as e:
     print(f"❌ Import failed: {e}")
     raise
@@ -1015,7 +1017,10 @@ def main():
     LR_LORA = float(args.lr_lora)
     INFER_STRENGTH = float(args.infer_strength)
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
-    print(f"[Config] residual_mode={RESIDUAL_MODE} | num_infer_steps={NUM_INFER_STEPS} | infer_strength={INFER_STRENGTH}")
+    print(
+        f"[Config] residual_mode={RESIDUAL_MODE} | num_infer_steps={NUM_INFER_STEPS} | "
+        f"infer_strength={INFER_STRENGTH} | residual_x0_l1_weight={RESIDUAL_X0_L1_WEIGHT}"
+    )
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
     train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
@@ -1126,7 +1131,18 @@ def main():
                 )
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
-                loss = F.mse_loss(out.float(), noise.float()) / float(grad_accum_steps)
+                eps_pred = out.float()
+                loss = F.mse_loss(eps_pred, noise.float()) / float(grad_accum_steps)
+                if RESIDUAL_X0_L1_WEIGHT > 0:
+                    with torch.cuda.amp.autocast(enabled=False):
+                        coef1 = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t, noisy.shape)
+                        coef2 = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t, noisy.shape)
+                        x0_pred = coef1 * noisy.float() - coef2 * eps_pred
+                    loss = loss + (
+                        RESIDUAL_X0_L1_WEIGHT
+                        * F.l1_loss(x0_pred, target_latent.float())
+                        / float(grad_accum_steps)
+                    )
 
             if USE_AMP:
                 scaler.scale(loss).backward()
