@@ -46,7 +46,7 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "quality_embed.pth")
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "infer_full_mse_lora_aligned_effective20")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "infer_full_mse_lora_aligned_effective20_residual")
 VIS_DIR = os.path.join(OUT_DIR, "vis")
 os.makedirs(VIS_DIR, exist_ok=True)
 
@@ -59,6 +59,7 @@ FIXED_NOISE_SEED = 42
 
 METRIC_Y_CHANNEL = True
 METRIC_SHAVE_BORDER = 4
+RESIDUAL_MODE = True
 
 # -------------------------
 # 3) Import your model
@@ -296,7 +297,7 @@ def validate_epoch(
 
             latents, run_ts = prepare_img2img_latents(
                 scheduler,
-                lr_latent.to(dtype=torch.float32),
+                torch.zeros_like(lr_latent).to(dtype=torch.float32),
                 strength=infer_strength,
                 noise_seed=FIXED_NOISE_SEED,
             )
@@ -316,7 +317,8 @@ def validate_epoch(
                         out, _ = out.chunk(2, dim=1)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-            pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+            pred_latent = latents + lr_latent
+            pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
             gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -423,6 +425,7 @@ def main():
 
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
     print(f"[Config] num_infer_steps={args.num_infer_steps} | infer_strength={args.infer_strength}")
+    print(f"[Config] residual_mode={RESIDUAL_MODE}")
 
     val_ds = ValImageDataset(args.val_dir, max_files=args.max_samples)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=(DEVICE == "cuda"))

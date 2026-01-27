@@ -1,7 +1,8 @@
-# experiments/train_full_mse_lora_aligned.py
-# NOTE: Based on your current train_full_mse.py baseline, with two focused changes:
-#   (1) Validation/inference uses a scheduler aligned to the training betas, and supports strength=0.5 (DDIM img2img-style init)
-#   (2) Add LoRA on cross-attn (Q/K/V + out proj) for the last K=4 PixArt blocks (rank=8)
+# experiments/train_full_mse_lora_aligned_strength05_fixdevice_residual.py
+# NOTE: Residualized training variant of train_full_mse_lora_aligned_strength05_fixdevice.py
+#   (1) Train on delta latent: target = hr_latent - lr_latent
+#   (2) Validation uses 20 effective denoise steps (num_infer_steps=40, strength=0.5)
+#   (3) Sampling starts from zero-delta and adds lr_latent back before decoding
 
 import os
 import sys
@@ -94,13 +95,14 @@ SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
 SMOKE_VAL_SAMPLES = 20
 
-NUM_INFER_STEPS = 20
+NUM_INFER_STEPS = 40
 FIXED_NOISE_SEED = 42
 
 VAL_DEGRADE_MODE = "realistic"  # "realistic" / "bicubic"
 
 # $$ [MOD-SCHEDULE-2] inference strength (0..1), default 0.5 as you requested
 INFER_STRENGTH = 0.5
+RESIDUAL_MODE = True
 
 PSNR_SWITCH = 24.0
 KEEP_LAST_EPOCHS = 3
@@ -809,10 +811,11 @@ def validate_epoch(
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())
 
-            # $$ [MOD-SCHEDULE-4] img2img-style init: start from lr_latent + noise(strength)
+            # $$ [MOD-SCHEDULE-4] img2img-style init:
+            # residual mode -> start from zero delta + noise(strength)
             latents, run_ts = prepare_img2img_latents(
                 scheduler,
-                lr_latent.to(dtype=torch.float32),
+                torch.zeros_like(lr_latent).to(dtype=torch.float32),
                 strength=infer_strength,
                 noise_seed=FIXED_NOISE_SEED,
             )
@@ -833,7 +836,8 @@ def validate_epoch(
                         out, _ = out.chunk(2, dim=1)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-            pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+            pred_latent = latents + lr_latent
+            pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
             gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -918,7 +922,7 @@ def validate_overfit_latent(
 
         latents, run_ts = prepare_img2img_latents(
             scheduler,
-            lr_latent,
+            torch.zeros_like(lr_latent),
             strength=infer_strength,
             noise_seed=FIXED_NOISE_SEED,
         )
@@ -938,7 +942,8 @@ def validate_overfit_latent(
                     out, _ = out.chunk(2, dim=1)
             latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-        pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+        pred_latent = latents + lr_latent
+        pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
         pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
         gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -1010,6 +1015,7 @@ def main():
     LR_LORA = float(args.lr_lora)
     INFER_STRENGTH = float(args.infer_strength)
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
+    print(f"[Config] residual_mode={RESIDUAL_MODE} | num_infer_steps={NUM_INFER_STEPS} | infer_strength={INFER_STRENGTH}")
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
     train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
@@ -1100,7 +1106,8 @@ def main():
             B = hr_latent.shape[0]
             t = torch.randint(0, 1000, (B,), device=DEVICE).long()
             noise = torch.randn_like(hr_latent)
-            noisy = diffusion.q_sample(hr_latent, t, noise)
+            target_latent = hr_latent - lr_latent
+            noisy = diffusion.q_sample(target_latent, t, noise)
 
             if step_idx % grad_accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
