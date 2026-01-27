@@ -391,11 +391,40 @@ class MultiLevelAdapterSE(MultiLevelAdapterFPN):
         return p0, p1, p2, p3
 
 
+class MultiLevelAdapterFPNHF(MultiLevelAdapterFPN):
+    def __init__(self, in_channels=4, hidden_size=1152, base_channels=128):
+        super().__init__(in_channels=in_channels, hidden_size=hidden_size, base_channels=base_channels)
+        kernel = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]], dtype=torch.float32)
+        self.register_buffer("hf_kernel", kernel.view(1, 1, 3, 3))
+        self.hf_body = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1, stride=2),
+            nn.SiLU(),
+            ResBlock(base_channels),
+        )
+        self.hf_proj = self._make_projection(base_channels, hidden_size, stride=1)
+
+    def _laplacian(self, x):
+        c = x.shape[1]
+        weight = self.hf_kernel.repeat(c, 1, 1, 1)
+        return F.conv2d(x, weight, padding=1, groups=c)
+
+    def forward(self, x):
+        features = super().forward(x)
+        hf = self._laplacian(x)
+        hf = self.hf_body(hf)
+        hf = self.hf_proj(hf)
+        return features + [hf]
+
+
 def build_adapter(adapter_type: str, in_channels: int = 4, hidden_size: int = 1152):
     if adapter_type == "fpn":
         return MultiLevelAdapterFPN(in_channels=in_channels, hidden_size=hidden_size)
     if adapter_type == "fpn_se":
         return MultiLevelAdapterSE(in_channels=in_channels, hidden_size=hidden_size)
+    if adapter_type == "fpn_hf":
+        return MultiLevelAdapterFPNHF(in_channels=in_channels, hidden_size=hidden_size)
     raise ValueError(f"Unknown adapter_type={adapter_type}")
 
 
