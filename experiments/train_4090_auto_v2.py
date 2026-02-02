@@ -67,6 +67,10 @@ DEVICE = "cuda"
 COMPUTE_DTYPE = torch.bfloat16 
 SEED = 3407
 DETERMINISTIC = True
+FAST_DEV_RUN = os.getenv("FAST_DEV_RUN", "0") == "1"
+FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
+FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
+FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
 
 # Optimization Dynamics
 BATCH_SIZE = 1 
@@ -143,6 +147,14 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
     np.random.seed(worker_seed)
     torch.manual_seed(worker_seed)
+
+def randn_like_with_generator(tensor, generator):
+    return torch.randn(
+        tensor.shape,
+        device=tensor.device,
+        dtype=tensor.dtype,
+        generator=generator,
+    )
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -314,7 +326,7 @@ def should_keep_ckpt(psnr_v, lpips_v):
     if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
     return (1, -psnr_v)
 
-def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics):
+def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen):
     # 1. 准备 State Dict (约 7.5GB)
     # Strategy-1: save ALL PixArt params that are actually trainable (requires_grad=True), not name-based filtering.
     trainable_names = {n for n, p in pixart.named_parameters() if p.requires_grad}
@@ -330,6 +342,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
             "numpy": np.random.get_state(),
             "python": random.getstate(),
         },
+        "dl_gen_state": dl_gen.get_state(),
         "pixart_trainable": pixart_sd,
         "best_records": best_records
     }
@@ -408,7 +421,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
 
     return best_records
 
-def resume(pixart, adapter, optimizer):
+def resume(pixart, adapter, optimizer, dl_gen):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
@@ -428,6 +441,12 @@ def resume(pixart, adapter, optimizer):
             if rs.get("python") is not None: random.setstate(rs["python"])
         except Exception as e:
             print(f"⚠️ RNG restore failed (non-fatal): {e}")
+    dl_state = ckpt.get("dl_gen_state", None)
+    if dl_state is not None:
+        try:
+            dl_gen.set_state(dl_state)
+        except Exception as e:
+            print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
 # ================= 7. Validation (Deterministic, 50-step only) =================
@@ -444,7 +463,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     val_gen = torch.Generator(device=DEVICE)
     val_gen.manual_seed(SEED)
 
-    for steps in VAL_STEPS_LIST:
+    steps_list = [FAST_VAL_STEPS] if FAST_DEV_RUN else VAL_STEPS_LIST
+    for steps in steps_list:
         scheduler = DDIMScheduler(
             num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
             clip_sample=False, prediction_type="epsilon", set_alpha_to_one=False,
@@ -464,9 +484,9 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if USE_LQ_INIT:
                 latents = z_lr.clone()
                 if INIT_NOISE_STD > 0:
-                    latents = latents + INIT_NOISE_STD * torch.randn_like(latents, generator=val_gen)
+                    latents = latents + INIT_NOISE_STD * randn_like_with_generator(latents, val_gen)
             else:
-                latents = torch.randn_like(z_hr, generator=val_gen)
+                latents = randn_like_with_generator(z_hr, val_gen)
             cond = adapter(z_lr.float())
 
             for t in scheduler.timesteps:
@@ -513,6 +533,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                 plt.savefig(save_path, bbox_inches="tight")
                 plt.close()
                 vis_done = True
+            if FAST_DEV_RUN and len(psnrs) >= FAST_VAL_BATCHES:
+                break
 
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
@@ -563,13 +585,23 @@ def main():
     optimizer = torch.optim.AdamW(params, lr=LR_BASE)
     diffusion = IDDPM(str(1000))
     
-    ep_start, step, best = resume(pixart, adapter, optimizer)
+    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
     
     print("🚀 Auto-Curriculum Training Started.")
+    max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
+    if FAST_DEV_RUN:
+        print(
+            "⚡ FAST_DEV_RUN enabled: "
+            f"max_steps={FAST_TRAIN_STEPS}, val_batches={FAST_VAL_BATCHES}, val_steps={FAST_VAL_STEPS}"
+        )
     
     for epoch in range(ep_start, 1000):
+        if max_steps is not None and step >= max_steps:
+            break
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
         for i, batch in enumerate(pbar):
+            if max_steps is not None and step >= max_steps:
+                break
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.sample() * vae.config.scaling_factor
@@ -657,8 +689,11 @@ def main():
         
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
         # Choose metrics from BEST_VAL_STEPS for checkpoint selection
-        metrics = val_dict[int(BEST_VAL_STEPS)]
-        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics)
+        if int(BEST_VAL_STEPS) in val_dict:
+            metrics = val_dict[int(BEST_VAL_STEPS)]
+        else:
+            metrics = next(iter(val_dict.values()))
+        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen)
 
 if __name__ == "__main__":
     main()
