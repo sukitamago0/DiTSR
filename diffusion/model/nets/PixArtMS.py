@@ -429,6 +429,7 @@ class PixArtMS(PixArt):
         data_info=None,
         adapter_cond=None,      
         injection_mode='hybrid',
+        force_drop_ids=None,
         **kwargs,
     ):
         bs = x.shape[0]
@@ -485,7 +486,7 @@ class PixArtMS(PixArt):
         t = self.t_embedder(timestep)
         t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
         t0 = self.t_block(t)
-        y = self.y_embedder(y, self.training)
+        y = self.y_embedder(y, self.training, force_drop_ids=force_drop_ids)
 
         # Cross-Attn Injection (取 adapter_features 的最后一个特征作为全局特征)
         if len(adapter_features) > 0 and injection_mode in ['cross_attn', 'hybrid']:
@@ -602,4 +603,3 @@ class PixArtMS(PixArt):
 @MODELS.register_module()
 def PixArtMS_XL_2(**kwargs):
     return PixArtMS(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-

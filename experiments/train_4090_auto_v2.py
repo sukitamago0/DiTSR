@@ -65,6 +65,8 @@ LAST_CKPT_PATH = os.path.join(CKPT_DIR, "last.pth")  # unified with save_smart/r
 
 DEVICE = "cuda"
 COMPUTE_DTYPE = torch.bfloat16 
+SEED = 3407
+DETERMINISTIC = True
 
 # Optimization Dynamics
 BATCH_SIZE = 1 
@@ -86,6 +88,9 @@ VAL_STEPS_LIST = [50]   # training-time validation uses ONLY 50-step sampling (m
 BEST_VAL_STEPS = 50         # user choice: select best checkpoint by VAL@50
 PSNR_SWITCH = 24.0
 KEEP_TOPK = 1
+CFG_SCALE = 3.0
+USE_LQ_INIT = True
+INIT_NOISE_STD = 0.0
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
     # Anchor losses are always active (diffusion eps MSE + image L1).
@@ -122,6 +127,22 @@ def rgb01_to_y01(rgb01):
 
 def shave_border(x, shave=4):
     return x[..., shave:-shave, shave:-shave]
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if DETERMINISTIC:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def seed_worker(worker_id):
+    worker_seed = SEED + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -409,16 +430,19 @@ def resume(pixart, adapter, optimizer):
             print(f"⚠️ RNG restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
-# ================= 7. Validation (PURE NOISE, 50-step only) =================
+# ================= 7. Validation (Deterministic, 50-step only) =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
     """
-    Validation uses PURE NOISE start (aligned with your previous training).
+    Validation uses deterministic init (LQ-init or fixed noise).
     We report VAL@50 only (main tracking & best ckpt).
     """
     print(f"🔎 Validating Epoch {epoch+1}...")
     pixart.eval(); adapter.eval()
     results = {}
+
+    val_gen = torch.Generator(device=DEVICE)
+    val_gen.manual_seed(SEED)
 
     for steps in VAL_STEPS_LIST:
         scheduler = DDIMScheduler(
@@ -436,17 +460,33 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
-            # Pure noise start
-            latents = torch.randn_like(z_hr)
+            # Deterministic init: LQ-init (optional) or fixed noise.
+            if USE_LQ_INIT:
+                latents = z_lr.clone()
+                if INIT_NOISE_STD > 0:
+                    latents = latents + INIT_NOISE_STD * torch.randn_like(latents, generator=val_gen)
+            else:
+                latents = torch.randn_like(z_hr, generator=val_gen)
             cond = adapter(z_lr.float())
 
             for t in scheduler.timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                    out = pixart(x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
-                                 mask=None, data_info=data_info,
-                                 adapter_cond=cond, injection_mode="hybrid")
-                    if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
+                    drop_uncond = torch.ones(latents.shape[0], device=DEVICE)
+                    drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
+                    out_uncond = pixart(
+                        x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                        mask=None, data_info=data_info, adapter_cond=cond,
+                        injection_mode="hybrid", force_drop_ids=drop_uncond
+                    )
+                    out_cond = pixart(
+                        x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                        mask=None, data_info=data_info, adapter_cond=cond,
+                        injection_mode="hybrid", force_drop_ids=drop_cond
+                    )
+                    if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
+                    if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
+                    out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
@@ -485,9 +525,20 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 # ================= 8. Main =================
 def main():
     # Setup
+    seed_everything(SEED)
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
     val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=VAL_LR_DIR, crop_size=512)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=dl_gen,
+    )
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
     
     # Models
@@ -547,7 +598,8 @@ def main():
                 z0 = c1 * zt.float() - c2 * eps
                 
                 # Patch Crop (32x32)
-                top, left = random.randint(0,32), random.randint(0,32)
+                top = torch.randint(0, 33, (1,), device=DEVICE).item()
+                left = torch.randint(0, 33, (1,), device=DEVICE).item()
                 z0_c = z0[..., top:top+32, left:left+32]
                 zh_c = zh.float()[..., top:top+32, left:left+32]
                 
