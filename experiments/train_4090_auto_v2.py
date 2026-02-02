@@ -165,7 +165,7 @@ class DegradationPipeline:
         self.noise_range = (0.0, 0.02)
         self.downscale_factor = 0.25 
 
-    def __call__(self, hr_tensor, return_meta: bool = False, meta=None):
+    def __call__(self, hr_tensor, return_meta: bool = False, meta=None, generator=None):
         """
         hr_tensor: [C,H,W] in [-1,1].
         If meta is None: sample degradation and optionally return meta for strict replay.
@@ -175,14 +175,31 @@ class DegradationPipeline:
 
         # -------- sample or read params --------
         if meta is None:
-            blur_applied = (random.random() < 0.8)
+            if generator is None:
+                blur_applied = (random.random() < 0.8)
+            else:
+                blur_applied = bool(torch.rand((), generator=generator).item() < 0.8)
             if blur_applied:
-                k_size = int(random.choice(self.blur_kernels))
-                sigma = float(random.uniform(*self.blur_sigma_range))
+                if generator is None:
+                    k_size = int(random.choice(self.blur_kernels))
+                    sigma = float(random.uniform(*self.blur_sigma_range))
+                else:
+                    kernel_idx = int(torch.randint(0, len(self.blur_kernels), (1,), generator=generator).item())
+                    k_size = int(self.blur_kernels[kernel_idx])
+                    sigma = float(
+                        torch.empty((), generator=generator).uniform_(
+                            self.blur_sigma_range[0], self.blur_sigma_range[1]
+                        ).item()
+                    )
             else:
                 k_size = 0
                 sigma = 0.0
-            noise_std = float(random.uniform(*self.noise_range))
+            if generator is None:
+                noise_std = float(random.uniform(*self.noise_range))
+            else:
+                noise_std = float(
+                    torch.empty((), generator=generator).uniform_(self.noise_range[0], self.noise_range[1]).item()
+                )
         else:
             # meta keys are tensors; convert safely
             blur_applied = bool(int(meta["blur_applied"].item()))
@@ -203,7 +220,15 @@ class DegradationPipeline:
         # 3. Noise (strict replay requires the exact noise tensor)
         if noise_std > 0:
             if meta is None:
-                noise = torch.randn_like(lr_small)
+                if generator is None:
+                    noise = torch.randn_like(lr_small)
+                else:
+                    noise = torch.randn(
+                        lr_small.shape,
+                        device=lr_small.device,
+                        dtype=lr_small.dtype,
+                        generator=generator,
+                    )
             else:
                 noise = meta["noise"].to(lr_small.device, dtype=lr_small.dtype)
             lr_small = lr_small + noise * noise_std
@@ -236,6 +261,16 @@ class DF2K_Online_Dataset(Dataset):
         self.pipeline = DegradationPipeline(crop_size)
         self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         self.to_tensor = transforms.ToTensor()
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _make_generator(self, idx: int):
+        gen = torch.Generator()
+        seed = SEED + (self.epoch * 1_000_000) + int(idx)
+        gen.manual_seed(seed)
+        return gen
 
     def __len__(self):
         return len(self.hr_paths)
@@ -245,18 +280,23 @@ class DF2K_Online_Dataset(Dataset):
             hr_pil = Image.open(self.hr_paths[idx]).convert("RGB")
         except:
             return self.__getitem__((idx + 1) % len(self))
-        
+
+        gen = None
         if self.is_train:
+            gen = self._make_generator(idx)
             if hr_pil.width >= self.crop_size and hr_pil.height >= self.crop_size:
-                i, j, h, w = transforms.RandomCrop.get_params(hr_pil, (self.crop_size, self.crop_size))
-                hr_crop = TF.crop(hr_pil, i, j, h, w)
+                max_top = hr_pil.height - self.crop_size + 1
+                max_left = hr_pil.width - self.crop_size + 1
+                top = int(torch.randint(0, max_top, (1,), generator=gen).item())
+                left = int(torch.randint(0, max_left, (1,), generator=gen).item())
+                hr_crop = TF.crop(hr_pil, top, left, self.crop_size, self.crop_size)
             else:
                 hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         else:
             hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
-        
+
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True)
+        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
         return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
@@ -598,6 +638,7 @@ def main():
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps:
             break
+        train_ds.set_epoch(epoch)
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
         for i, batch in enumerate(pbar):
             if max_steps is not None and step >= max_steps:
