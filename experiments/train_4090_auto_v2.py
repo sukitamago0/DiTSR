@@ -93,7 +93,7 @@ BEST_VAL_STEPS = 50         # user choice: select best checkpoint by VAL@50
 PSNR_SWITCH = 24.0
 KEEP_TOPK = 1
 CFG_SCALE = 3.0
-USE_LQ_INIT = True
+USE_LQ_INIT = False
 INIT_NOISE_STD = 0.0
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
