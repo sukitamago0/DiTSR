@@ -187,9 +187,11 @@ class DegradationPipeline:
                     kernel_idx = int(torch.randint(0, len(self.blur_kernels), (1,), generator=generator).item())
                     k_size = int(self.blur_kernels[kernel_idx])
                     sigma = float(
-                        torch.empty((), generator=generator).uniform_(
-                            self.blur_sigma_range[0], self.blur_sigma_range[1]
-                        ).item()
+                        (
+                            self.blur_sigma_range[0]
+                            + (self.blur_sigma_range[1] - self.blur_sigma_range[0])
+                            * torch.rand((), generator=generator).item()
+                        )
                     )
             else:
                 k_size = 0
@@ -198,7 +200,9 @@ class DegradationPipeline:
                 noise_std = float(random.uniform(*self.noise_range))
             else:
                 noise_std = float(
-                    torch.empty((), generator=generator).uniform_(self.noise_range[0], self.noise_range[1]).item()
+                    self.noise_range[0]
+                    + (self.noise_range[1] - self.noise_range[0])
+                    * torch.rand((), generator=generator).item()
                 )
         else:
             # meta keys are tensors; convert safely
