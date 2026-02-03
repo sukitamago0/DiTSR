@@ -102,6 +102,10 @@ NOISE_CONS_WARMUP = 2000
 NOISE_CONS_RAMP = 6000
 NOISE_CONS_WEIGHT = 0.1
 NOISE_CONS_PROB = 0.5
+USE_LR_CONSISTENCY = False
+LR_CONS_WARMUP = 1000
+LR_CONS_RAMP = 5000
+LR_CONS_WEIGHT = 0.5
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
     # Anchor losses are always active (diffusion eps MSE + image L1).
@@ -109,18 +113,17 @@ def get_loss_weights(global_step):
     # LR-consistency (strict replayed degradation) ramps up BEFORE LPIPS to anchor details.
     weights = {'mse': 1.0, 'l1': 1.0}
 
-    # --- LR consistency schedule ---
-    # Step 0-1000: cons=0.0  (let structure/color settle)
-    # Step 1000-6000: cons ramps to 1.0
-    CONS_WARMUP = 1000
-    CONS_RAMP   = 5000
-    if global_step < CONS_WARMUP:
-        weights['cons'] = 0.0
-    elif global_step < (CONS_WARMUP + CONS_RAMP):
-        p = (global_step - CONS_WARMUP) / CONS_RAMP
-        weights['cons'] = 1.0 * p
+    # --- LR consistency schedule (optional) ---
+    if USE_LR_CONSISTENCY:
+        if global_step < LR_CONS_WARMUP:
+            weights['cons'] = 0.0
+        elif global_step < (LR_CONS_WARMUP + LR_CONS_RAMP):
+            p = (global_step - LR_CONS_WARMUP) / LR_CONS_RAMP
+            weights['cons'] = LR_CONS_WEIGHT * p
+        else:
+            weights['cons'] = LR_CONS_WEIGHT
     else:
-        weights['cons'] = 1.0
+        weights['cons'] = 0.0
 
     # --- LPIPS schedule ---
     if global_step < WARMUP_STEPS:
@@ -745,9 +748,9 @@ def main():
                 else:
                     loss_noise_cons = torch.tensor(0.0, device=DEVICE)
 
-                # --- Strict LR consistency (replay EXACT same degradation used to generate LR) ---
+                # --- Strict LR consistency (optional) ---
                 # Decode FULL z0 (64x64 latent -> 512x512 image) to keep degradation context consistent.
-                if w.get("cons", 0.0) > 0:
+                if USE_LR_CONSISTENCY and w.get("cons", 0.0) > 0:
                     img_full = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
                     # Replay degradation on pred using per-sample meta from dataset
                     deg = batch.get("deg", None)
