@@ -95,6 +95,13 @@ KEEP_TOPK = 1
 CFG_SCALE = 3.0
 USE_LQ_INIT = False
 INIT_NOISE_STD = 0.0
+USE_CFG_TRAIN = True
+CFG_TRAIN_SCALE = 3.0
+USE_NOISE_CONSISTENCY = True
+NOISE_CONS_WARMUP = 2000
+NOISE_CONS_RAMP = 6000
+NOISE_CONS_WEIGHT = 0.1
+NOISE_CONS_PROB = 0.5
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
     # Anchor losses are always active (diffusion eps MSE + image L1).
@@ -123,6 +130,15 @@ def get_loss_weights(global_step):
         weights['lpips'] = TARGET_LPIPS_WEIGHT * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
+
+    # --- Noise-level consistency schedule ---
+    if global_step < NOISE_CONS_WARMUP:
+        weights['noise_cons'] = 0.0
+    elif global_step < (NOISE_CONS_WARMUP + NOISE_CONS_RAMP):
+        progress = (global_step - NOISE_CONS_WARMUP) / NOISE_CONS_RAMP
+        weights['noise_cons'] = NOISE_CONS_WEIGHT * progress
+    else:
+        weights['noise_cons'] = NOISE_CONS_WEIGHT
     return weights
 
 def rgb01_to_y01(rgb01):
@@ -659,9 +675,24 @@ def main():
             cond = adapter(zl.float())
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                out = pixart(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
-                if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
-                eps = out.float()
+                if USE_CFG_TRAIN:
+                    drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
+                    drop_cond = torch.zeros(zt.shape[0], device=DEVICE)
+                    out_uncond = pixart(
+                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond,
+                        injection_mode="hybrid", force_drop_ids=drop_uncond
+                    )
+                    out_cond = pixart(
+                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond,
+                        injection_mode="hybrid", force_drop_ids=drop_cond
+                    )
+                    if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
+                    if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
+                    eps = out_uncond + CFG_TRAIN_SCALE * (out_cond - out_uncond)
+                else:
+                    out = pixart(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
+                    if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
+                    eps = out.float()
 
                 # --- Automated Loss Weights ---
                 w = get_loss_weights(step)
@@ -684,6 +715,35 @@ def main():
                 img_t = vae.decode(zh_c/vae.config.scaling_factor).sample.clamp(-1,1)
 
                 loss_l1 = F.l1_loss(img_p, img_t)
+
+                # --- Noise-level consistency (z0 consistency across t1/t2) ---
+                if USE_NOISE_CONSISTENCY and w.get("noise_cons", 0.0) > 0 and torch.rand(()) < NOISE_CONS_PROB:
+                    t2 = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
+                    zt2 = diffusion.q_sample(zh, t2, noise)
+                    if USE_CFG_TRAIN:
+                        out2_uncond = pixart(
+                            x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                            injection_mode="hybrid", force_drop_ids=drop_uncond
+                        )
+                        out2_cond = pixart(
+                            x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                            injection_mode="hybrid", force_drop_ids=drop_cond
+                        )
+                        if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
+                        if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
+                        eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
+                    else:
+                        out2 = pixart(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
+                        if out2.shape[1] == 8: out2, _ = out2.chunk(2, dim=1)
+                        eps2 = out2.float()
+
+                    with torch.no_grad():
+                        c1b = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t2, zt2.shape)
+                        c2b = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t2, zt2.shape)
+                    z0_t2 = c1b * zt2.float() - c2b * eps2
+                    loss_noise_cons = F.l1_loss(z0, z0_t2.detach())
+                else:
+                    loss_noise_cons = torch.tensor(0.0, device=DEVICE)
 
                 # --- Strict LR consistency (replay EXACT same degradation used to generate LR) ---
                 # Decode FULL z0 (64x64 latent -> 512x512 image) to keep degradation context consistent.
@@ -719,7 +779,13 @@ def main():
 
                 loss_lpips = lpips_fn(img_p, img_t).mean() if w['lpips'] > 0 else torch.tensor(0.0, device=DEVICE)
 
-                loss = (w['mse']*loss_mse + w['l1']*loss_l1 + w['lpips']*loss_lpips + w.get('cons',0.0)*loss_cons) / GRAD_ACCUM_STEPS
+                loss = (
+                    w['mse']*loss_mse
+                    + w['l1']*loss_l1
+                    + w['lpips']*loss_lpips
+                    + w.get('cons',0.0)*loss_cons
+                    + w.get('noise_cons', 0.0)*loss_noise_cons
+                ) / GRAD_ACCUM_STEPS
 
             loss.backward()
 
@@ -730,7 +796,13 @@ def main():
                 step += 1
 
             if i % 10 == 0:
-                pbar.set_postfix({'mse': f"{loss_mse:.3f}", 'l1': f"{loss_l1:.3f}", 'lp': f"{loss_lpips:.3f}", 'cons': f"{loss_cons:.3f}"})
+                pbar.set_postfix({
+                    'mse': f"{loss_mse:.3f}",
+                    'l1': f"{loss_l1:.3f}",
+                    'lp': f"{loss_lpips:.3f}",
+                    'cons': f"{loss_cons:.3f}",
+                    'ncons': f"{loss_noise_cons:.3f}",
+                })
 
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
         # Choose metrics from BEST_VAL_STEPS for checkpoint selection

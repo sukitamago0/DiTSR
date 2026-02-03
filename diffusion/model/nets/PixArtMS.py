@@ -382,6 +382,12 @@ class PixArtMS(PixArt):
         self.injection_scales = nn.ParameterList([
             nn.Parameter(torch.ones(1)) for _ in range(len(self.injection_layers))
         ])
+        self.adapter_alpha_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, len(self.injection_layers), bias=True),
+        )
+        nn.init.zeros_(self.adapter_alpha_mlp[-1].weight)
+        nn.init.zeros_(self.adapter_alpha_mlp[-1].bias)
 
         # [保留成功经验] LayerNorm，用于归一化 Adapter 特征
         self.input_adapter_ln = nn.LayerNorm(hidden_size, elementwise_affine=True)
@@ -485,6 +491,8 @@ class PixArtMS(PixArt):
 
         t = self.t_embedder(timestep)
         t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
+        alpha_logits = self.adapter_alpha_mlp(t)
+        alpha_dynamic = torch.sigmoid(alpha_logits)
         t0 = self.t_block(t)
         y = self.y_embedder(y, self.training, force_drop_ids=force_drop_ids)
 
@@ -521,7 +529,7 @@ class PixArtMS(PixArt):
             # --------------------------------------------------------
             if len(adapter_features) > 0 and injection_mode in ['input', 'hybrid'] and i in self.injection_layers:
                 scale_idx = self.injection_layers.index(i)  # 0/1/2/3
-                alpha = self.injection_scales[scale_idx]
+                alpha = self.injection_scales[scale_idx] * alpha_dynamic[:, scale_idx].view(-1, 1, 1)
 
                 # choose the matching scale feature; fallback to the deepest
                 feat_idx = scale_idx if scale_idx < len(adapter_features) else -1
