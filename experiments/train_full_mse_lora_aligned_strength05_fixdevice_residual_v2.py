@@ -1,7 +1,6 @@
-# experiments/train_full_mse_lora_aligned.py
-# NOTE: Based on your current train_full_mse.py baseline, with two focused changes:
-#   (1) Validation/inference uses a scheduler aligned to the training betas, and supports strength=0.5 (DDIM img2img-style init)
-#   (2) Add LoRA on cross-attn (Q/K/V + out proj) for the last K=4 PixArt blocks (rank=8)
+# experiments/train_full_mse_lora_aligned_strength05_fixdevice_residual_v2.py
+# NOTE: Residualized SR variant with lightweight multi-scale + HF adapter, low-noise training,
+#       and staged loss schedule for structure-first then detail refinement.
 
 import os
 import sys
@@ -59,7 +58,7 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "quality_embed.pth")
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_full_mse_lora_aligned")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_full_mse_lora_aligned_residual_v2")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -94,13 +93,21 @@ SMOKE = False
 SMOKE_TRAIN_SAMPLES = 20
 SMOKE_VAL_SAMPLES = 20
 
-NUM_INFER_STEPS = 20
+NUM_INFER_STEPS = 40
 FIXED_NOISE_SEED = 42
 
 VAL_DEGRADE_MODE = "realistic"  # "realistic" / "bicubic"
 
 # $$ [MOD-SCHEDULE-2] inference strength (0..1), default 0.5 as you requested
 INFER_STRENGTH = 0.5
+RESIDUAL_MODE = True
+RESIDUAL_X0_L1_WEIGHT = 0.1
+PIXEL_L1_WEIGHT = 0.1
+HF_L1_WEIGHT = 0.05
+LPIPS_WEIGHT = 0.1
+LPIPS_EVERY = 1
+STAGE1_EPOCHS = 5
+T_TRAIN_MAX = 300
 
 PSNR_SWITCH = 24.0
 KEEP_LAST_EPOCHS = 3
@@ -118,6 +125,7 @@ try:
     from diffusion.model.nets.PixArtMS import PixArtMS_XL_2
     from diffusion.model.nets.adapter import build_adapter
     from diffusion import IDDPM
+    from diffusion.model.gaussian_diffusion import _extract_into_tensor
 except ImportError as e:
     print(f"❌ Import failed: {e}")
     raise
@@ -197,6 +205,16 @@ def _jpeg_compress_tensor(x11: torch.Tensor, quality: int) -> torch.Tensor:
     img = TF.to_tensor(img)
     img = (img * 2.0) - 1.0
     return img
+
+
+def laplacian_highpass(x: torch.Tensor) -> torch.Tensor:
+    kernel = torch.tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+        device=x.device,
+        dtype=x.dtype,
+    )
+    weight = kernel.view(1, 1, 3, 3).repeat(x.shape[1], 1, 1, 1)
+    return F.conv2d(x, weight, padding=1, groups=x.shape[1])
 
 def center_crop(pil: Image.Image, size: int = 512) -> Image.Image:
     w, h = pil.size
@@ -809,10 +827,11 @@ def validate_epoch(
             with torch.cuda.amp.autocast(enabled=False):
                 cond = adapter(lr_latent.float())
 
-            # $$ [MOD-SCHEDULE-4] img2img-style init: start from lr_latent + noise(strength)
+            # $$ [MOD-SCHEDULE-4] img2img-style init:
+            # residual mode -> start from zero delta + noise(strength)
             latents, run_ts = prepare_img2img_latents(
                 scheduler,
-                lr_latent.to(dtype=torch.float32),
+                torch.zeros_like(lr_latent).to(dtype=torch.float32),
                 strength=infer_strength,
                 noise_seed=FIXED_NOISE_SEED,
             )
@@ -833,7 +852,8 @@ def validate_epoch(
                         out, _ = out.chunk(2, dim=1)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-            pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+            pred_latent = latents + lr_latent
+            pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
             pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
             gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -918,7 +938,7 @@ def validate_overfit_latent(
 
         latents, run_ts = prepare_img2img_latents(
             scheduler,
-            lr_latent,
+            torch.zeros_like(lr_latent),
             strength=infer_strength,
             noise_seed=FIXED_NOISE_SEED,
         )
@@ -938,7 +958,8 @@ def validate_overfit_latent(
                     out, _ = out.chunk(2, dim=1)
             latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
-        pred_img = vae.decode(latents / vae.config.scaling_factor).sample
+        pred_latent = latents + lr_latent
+        pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
         pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
 
         gt_img = vae.decode(hr_latent / vae.config.scaling_factor).sample
@@ -988,7 +1009,7 @@ def main():
     parser.add_argument("--smoke_train", type=int, default=None, help="override smoke train samples")
     parser.add_argument("--smoke_val", type=int, default=None, help="override smoke val samples")
     parser.add_argument("--smoke_epochs", type=int, default=None, help="override smoke epochs")
-    parser.add_argument("--adapter_type", type=str, default="fpn_se", choices=["fpn", "fpn_se"])
+    parser.add_argument("--adapter_type", type=str, default="fpn_hf", choices=["fpn", "fpn_se", "fpn_hf"])
     parser.add_argument("--overfit_latent_path", type=str, default=None, help="use one latent file for strict overfit train+val")
     parser.add_argument("--resume", type=str, default=None, help="path to resume ckpt (prefer last_full_state.pth)")
     parser.add_argument("--grad_accum_steps", type=int, default=GRAD_ACCUM_STEPS, help="gradient accumulation steps")
@@ -1010,6 +1031,12 @@ def main():
     LR_LORA = float(args.lr_lora)
     INFER_STRENGTH = float(args.infer_strength)
     print(f"DEVICE={DEVICE} | AMP={USE_AMP} | cudnn.enabled={torch.backends.cudnn.enabled}")
+    print(
+        f"[Config] residual_mode={RESIDUAL_MODE} | num_infer_steps={NUM_INFER_STEPS} | "
+        f"infer_strength={INFER_STRENGTH} | residual_x0_l1_weight={RESIDUAL_X0_L1_WEIGHT} | "
+        f"pixel_l1_weight={PIXEL_L1_WEIGHT} | hf_l1_weight={HF_L1_WEIGHT} | "
+        f"lpips_weight={LPIPS_WEIGHT} | stage1_epochs={STAGE1_EPOCHS} | t_train_max={T_TRAIN_MAX}"
+    )
     scan_latent_schema(TRAIN_LATENT_DIR, n=50)
 
     train_max = SMOKE_TRAIN_SAMPLES if SMOKE else None
@@ -1090,6 +1117,7 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         pixart.train()
         adapter.train()
+        stage = 1 if (epoch < STAGE1_EPOCHS) else 2
         pbar = tqdm(train_loader, desc=f"Train Ep{epoch+1}", dynamic_ncols=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -1098,9 +1126,10 @@ def main():
             lr_latent = batch["lr_latent"].to(DEVICE).to(DTYPE_LATENT)
 
             B = hr_latent.shape[0]
-            t = torch.randint(0, 1000, (B,), device=DEVICE).long()
+            t = torch.randint(0, T_TRAIN_MAX, (B,), device=DEVICE).long()
             noise = torch.randn_like(hr_latent)
-            noisy = diffusion.q_sample(hr_latent, t, noise)
+            target_latent = hr_latent - lr_latent
+            noisy = diffusion.q_sample(target_latent, t, noise)
 
             if step_idx % grad_accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
@@ -1119,7 +1148,40 @@ def main():
                 )
                 if out.shape[1] == 8:
                     out, _ = out.chunk(2, dim=1)
-                loss = F.mse_loss(out.float(), noise.float()) / float(grad_accum_steps)
+                eps_pred = out.float()
+                loss = F.mse_loss(eps_pred, noise.float()) / float(grad_accum_steps)
+                with torch.cuda.amp.autocast(enabled=False):
+                    coef1 = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t, noisy.shape)
+                    coef2 = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t, noisy.shape)
+                    x0_pred = coef1 * noisy.float() - coef2 * eps_pred
+                if RESIDUAL_X0_L1_WEIGHT > 0:
+                    loss = loss + (
+                        RESIDUAL_X0_L1_WEIGHT
+                        * F.l1_loss(x0_pred, target_latent.float())
+                        / float(grad_accum_steps)
+                    )
+                if stage >= 2 and PIXEL_L1_WEIGHT > 0:
+                    pred_latent = x0_pred + lr_latent.float()
+                    loss = loss + (
+                        PIXEL_L1_WEIGHT
+                        * F.l1_loss(pred_latent, hr_latent.float())
+                        / float(grad_accum_steps)
+                    )
+                if stage >= 2 and HF_L1_WEIGHT > 0:
+                    pred_hf = laplacian_highpass(x0_pred)
+                    target_hf = laplacian_highpass(target_latent.float())
+                    loss = loss + (HF_L1_WEIGHT * F.l1_loss(pred_hf, target_hf) / float(grad_accum_steps))
+
+            if stage >= 2 and LPIPS_WEIGHT > 0 and lpips_fn is not None and (global_step % LPIPS_EVERY == 0):
+                with torch.cuda.amp.autocast(enabled=False):
+                    pred_latent = x0_pred + lr_latent.float()
+                    pred_img = vae.decode(pred_latent / vae.config.scaling_factor).sample
+                    gt_img = vae.decode(hr_latent.float() / vae.config.scaling_factor).sample
+                    pred_img_01 = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+                    gt_img_01 = torch.clamp((gt_img + 1.0) / 2.0, 0.0, 1.0)
+                    pred_norm = pred_img_01 * 2.0 - 1.0
+                    gt_norm = gt_img_01 * 2.0 - 1.0
+                    loss = loss + (LPIPS_WEIGHT * lpips_fn(pred_norm, gt_norm).mean() / float(grad_accum_steps))
 
             if USE_AMP:
                 scaler.scale(loss).backward()
