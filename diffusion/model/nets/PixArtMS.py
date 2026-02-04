@@ -377,7 +377,7 @@ class PixArtMS(PixArt):
         # ==========================================================
         # Input Injection (Multi-Level Support)
         # ==========================================================
-        self.injection_layers = [0, 7, 14, 21] 
+        self.injection_layers = [0, 4, 7, 10, 14, 18, 21, 25]
         
         self.injection_scales = nn.ParameterList([
             nn.Parameter(torch.ones(1)) for _ in range(len(self.injection_layers))
@@ -436,6 +436,9 @@ class PixArtMS(PixArt):
         for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        nn.init.zeros_(self.adapter_alpha_mlp[-1].weight)
+        nn.init.zeros_(self.adapter_alpha_mlp[-1].bias)
+        nn.init.zeros_(self.cross_gate_ms)
 
     def forward(
         self,
@@ -509,7 +512,7 @@ class PixArtMS(PixArt):
 
         # Cross-Attn Injection (multi-scale with pooling)
         if len(adapter_features) > 0 and injection_mode in ['cross_attn', 'hybrid']:
-            pool_hw = [16, 16, 8, 8]
+            pool_hw = [16, 16, 8, 8, 8, 8, 8, 8]
             vis_list = []
             for s, feat in enumerate(adapter_features[:len(self.injection_layers)]):
                 if feat.shape[1] == 1024:
@@ -524,6 +527,7 @@ class PixArtMS(PixArt):
                 v = v * self.cross_attn_scale * self.cross_gate_ms[s]
                 vis_list.append(v)
             vis_tokens = torch.cat(vis_list, dim=1)
+            vis_count = vis_tokens.shape[1]
             if y.dim() == 4:
                 vis_tokens = vis_tokens.unsqueeze(1)
                 concat_dim = 2
@@ -534,6 +538,9 @@ class PixArtMS(PixArt):
         if mask is not None:
              if mask.shape[0] != y.shape[0]: mask = mask.repeat(y.shape[0] // mask.shape[0], 1)
              mask = mask.squeeze(1).squeeze(1)
+             if 'vis_count' in locals() and vis_count > 0:
+                 vis_mask = torch.ones(mask.shape[0], vis_count, device=mask.device, dtype=mask.dtype)
+                 mask = torch.cat([mask, vis_mask], dim=1)
              y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, x.shape[-1])
              y_lens = mask.sum(dim=1).tolist()
         else:
