@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import io
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -83,7 +84,7 @@ LORA_ALPHA = 64
 # [Curriculum Logic]
 # Step 0-5000: L1=1.0, LPIPS=0.0 (Fix Color/Structure)
 # Step 5000-10000: LPIPS ramps up to 0.5
-WARMUP_STEPS = 8000
+WARMUP_STEPS = 0
 RAMP_UP_STEPS = 8000
 TARGET_LPIPS_WEIGHT = 0.30  # more conservative than 0.5
 
@@ -92,6 +93,8 @@ VAL_STEPS_LIST = [50]   # training-time validation uses ONLY 50-step sampling (m
 BEST_VAL_STEPS = 50         # user choice: select best checkpoint by VAL@50
 PSNR_SWITCH = 24.0
 KEEP_TOPK = 1
+VAL_MODE = "train_like"  # "bicubic" / "train_like" / "lr_dir"
+TRAIN_DEG_MODE = "highorder"  # "bicubic" / "highorder"
 CFG_SCALE = 3.0
 USE_LQ_INIT = False
 INIT_NOISE_STD = 0.0
@@ -125,11 +128,10 @@ def get_loss_weights(global_step):
     else:
         weights['cons'] = 0.0
 
-    # --- LPIPS schedule ---
-    if global_step < WARMUP_STEPS:
-        weights['lpips'] = 0.0
-    elif global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
-        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS
+    # --- LPIPS schedule (linear warmup from step 0) ---
+    if global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
+        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS if global_step > WARMUP_STEPS else 0.0
+        progress = max(0.0, min(1.0, progress))
         weights['lpips'] = TARGET_LPIPS_WEIGHT * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
@@ -180,9 +182,54 @@ class DegradationPipeline:
     def __init__(self, crop_size=512):
         self.crop_size = crop_size
         self.blur_kernels = [3, 5, 7]
-        self.blur_sigma_range = (0.2, 1.2)
+        self.blur_sigma_range = (0.2, 1.5)
+        self.aniso_sigma_range = (0.2, 2.5)
+        self.aniso_theta_range = (0.0, math.pi)
         self.noise_range = (0.0, 0.02)
-        self.downscale_factor = 0.25
+        self.downscale_factor = 0.25 
+
+    def _sample_uniform(self, low, high, generator):
+        if generator is None:
+            return float(random.uniform(low, high))
+        return float(low + (high - low) * torch.rand((), generator=generator).item())
+
+    def _sample_int(self, low, high, generator):
+        if generator is None:
+            return int(random.randint(low, high))
+        return int(torch.randint(low, high + 1, (1,), generator=generator).item())
+
+    def _sample_choice(self, choices, generator):
+        if generator is None:
+            return random.choice(choices)
+        idx = int(torch.randint(0, len(choices), (1,), generator=generator).item())
+        return choices[idx]
+
+    def _build_aniso_kernel(self, k, sigma_x, sigma_y, theta, device, dtype):
+        ax = torch.arange(-(k // 2), k // 2 + 1, device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        c, s = math.cos(theta), math.sin(theta)
+        x_rot = c * xx + s * yy
+        y_rot = -s * xx + c * yy
+        kernel = torch.exp(-0.5 * ((x_rot / sigma_x) ** 2 + (y_rot / sigma_y) ** 2))
+        kernel = kernel / kernel.sum()
+        return kernel
+
+    def _apply_aniso_blur(self, img, k, sigma_x, sigma_y, theta):
+        kernel = self._build_aniso_kernel(k, sigma_x, sigma_y, theta, img.device, img.dtype)
+        kernel = kernel.view(1, 1, k, k)
+        weight = kernel.repeat(img.shape[0], 1, 1, 1)
+        img = img.unsqueeze(0)
+        img = F.conv2d(img, weight, padding=k // 2, groups=img.shape[1])
+        return img.squeeze(0)
+
+    def _apply_jpeg(self, img, quality):
+        img_np = (img.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(img_np).save(buf, format="JPEG", quality=int(quality))
+        buf.seek(0)
+        out = Image.open(buf).convert("RGB")
+        out = TF.to_tensor(out).to(img.device, dtype=img.dtype)
+        return out
 
     def __call__(self, hr_tensor, return_meta: bool = False, meta=None, generator=None):
         """
@@ -194,51 +241,58 @@ class DegradationPipeline:
 
         # -------- sample or read params --------
         if meta is None:
-            if generator is None:
-                blur_applied = (random.random() < 0.8)
-            else:
-                blur_applied = bool(torch.rand((), generator=generator).item() < 0.8)
+            blur_applied = bool(self._sample_uniform(0.0, 1.0, generator) < 0.9)
+            blur_is_aniso = bool(self._sample_uniform(0.0, 1.0, generator) < 0.5)
             if blur_applied:
-                if generator is None:
-                    k_size = int(random.choice(self.blur_kernels))
-                    sigma = float(random.uniform(*self.blur_sigma_range))
+                k_size = self._sample_choice(self.blur_kernels, generator)
+                if blur_is_aniso:
+                    sigma_x = self._sample_uniform(*self.aniso_sigma_range, generator)
+                    sigma_y = self._sample_uniform(*self.aniso_sigma_range, generator)
+                    theta = self._sample_uniform(*self.aniso_theta_range, generator)
+                    sigma = 0.0
                 else:
-                    kernel_idx = int(torch.randint(0, len(self.blur_kernels), (1,), generator=generator).item())
-                    k_size = int(self.blur_kernels[kernel_idx])
-                    sigma = float(
-                        (
-                            self.blur_sigma_range[0]
-                            + (self.blur_sigma_range[1] - self.blur_sigma_range[0])
-                            * torch.rand((), generator=generator).item()
-                        )
-                    )
+                    sigma = self._sample_uniform(*self.blur_sigma_range, generator)
+                    sigma_x = 0.0
+                    sigma_y = 0.0
+                    theta = 0.0
             else:
                 k_size = 0
                 sigma = 0.0
-            if generator is None:
-                noise_std = float(random.uniform(*self.noise_range))
-            else:
-                noise_std = float(
-                    self.noise_range[0]
-                    + (self.noise_range[1] - self.noise_range[0])
-                    * torch.rand((), generator=generator).item()
-                )
+                sigma_x = 0.0
+                sigma_y = 0.0
+                theta = 0.0
+            resize_scale = self._sample_uniform(0.5, 1.5, generator)
+            resize_interp = self._sample_choice(
+                [transforms.InterpolationMode.NEAREST, transforms.InterpolationMode.BILINEAR, transforms.InterpolationMode.BICUBIC],
+                generator,
+            )
+            noise_std = self._sample_uniform(*self.noise_range, generator)
+            jpeg_quality = self._sample_int(30, 95, generator)
         else:
             # meta keys are tensors; convert safely
             blur_applied = bool(int(meta["blur_applied"].item()))
             k_size = int(meta["k_size"].item())
             sigma = float(meta["sigma"].item())
+            sigma_x = float(meta["sigma_x"].item())
+            sigma_y = float(meta["sigma_y"].item())
+            theta = float(meta["theta"].item())
             noise_std = float(meta["noise_std"].item())
+            resize_scale = float(meta["resize_scale"].item())
+            resize_interp = transforms.InterpolationMode(int(meta["resize_interp"].item()))
+            jpeg_quality = int(meta["jpeg_quality"].item())
 
         # 1. Blur
         if blur_applied:
             # torchvision gaussian_blur expects kernel size odd and >=3
-            img = TF.gaussian_blur(img, k_size, [sigma, sigma])
+            if sigma_x > 0 and sigma_y > 0:
+                img = self._apply_aniso_blur(img, k_size, sigma_x, sigma_y, theta)
+            else:
+                img = TF.gaussian_blur(img, k_size, [sigma, sigma])
 
-        # 2. Downsample
-        down_h = int(self.crop_size * self.downscale_factor)
-        down_w = int(self.crop_size * self.downscale_factor)
-        lr_small = TF.resize(img, [down_h, down_w], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+        # 2. Resize (random scale + interpolation)
+        mid_h = max(1, int(self.crop_size * resize_scale))
+        mid_w = max(1, int(self.crop_size * resize_scale))
+        lr_small = TF.resize(img, [mid_h, mid_w], interpolation=resize_interp, antialias=True)
 
         # 3. Noise (strict replay requires the exact noise tensor)
         if noise_std > 0:
@@ -259,7 +313,13 @@ class DegradationPipeline:
         else:
             noise = torch.zeros_like(lr_small)
 
-        # 4. Upsample
+        # 4. JPEG (optional, always applied in highorder)
+        lr_small = self._apply_jpeg(lr_small, jpeg_quality)
+
+        # 5. Final downsample to x4 then upsample back to crop size
+        down_h = int(self.crop_size * self.downscale_factor)
+        down_w = int(self.crop_size * self.downscale_factor)
+        lr_small = TF.resize(lr_small, [down_h, down_w], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = (lr * 2.0 - 1.0).clamp(-1.0, 1.0)
 
@@ -268,8 +328,14 @@ class DegradationPipeline:
                 "blur_applied": torch.tensor(int(blur_applied), dtype=torch.int64),
                 "k_size": torch.tensor(int(k_size), dtype=torch.int64),
                 "sigma": torch.tensor(float(sigma), dtype=torch.float32),
+                "sigma_x": torch.tensor(float(sigma_x), dtype=torch.float32),
+                "sigma_y": torch.tensor(float(sigma_y), dtype=torch.float32),
+                "theta": torch.tensor(float(theta), dtype=torch.float32),
                 "noise_std": torch.tensor(float(noise_std), dtype=torch.float32),
                 "noise": noise.detach().cpu().float(),
+                "resize_scale": torch.tensor(float(resize_scale), dtype=torch.float32),
+                "resize_interp": torch.tensor(int(resize_interp.value), dtype=torch.int64),
+                "jpeg_quality": torch.tensor(int(jpeg_quality), dtype=torch.int64),
                 "down_h": torch.tensor(int(down_h), dtype=torch.int64),
                 "down_w": torch.tensor(int(down_w), dtype=torch.int64),
             }
@@ -319,7 +385,15 @@ class DF2K_Online_Dataset(Dataset):
             hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
 
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
+        if self.is_train and TRAIN_DEG_MODE == "bicubic":
+            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4),
+                                 interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size),
+                                  interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
+            deg_meta = None
+        else:
+            lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
         return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
@@ -355,6 +429,36 @@ class DF2K_Val_Fixed_Dataset(Dataset):
 
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_crop))
+        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
+
+class DF2K_Val_Degraded_Dataset(Dataset):
+    def __init__(self, hr_root, crop_size=512, seed=3407, deg_mode="highorder"):
+        self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
+        self.crop_size = crop_size
+        self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        self.to_tensor = transforms.ToTensor()
+        self.pipeline = DegradationPipeline(crop_size)
+        self.seed = int(seed)
+        self.deg_mode = deg_mode
+
+    def __len__(self):
+        return len(self.hr_paths)
+
+    def __getitem__(self, idx):
+        hr_path = self.hr_paths[idx]
+        hr_pil = Image.open(hr_path).convert("RGB")
+        hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
+        hr_tensor = self.norm(self.to_tensor(hr_crop))
+        if self.deg_mode == "bicubic":
+            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4),
+                                 interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size),
+                                  interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
+        else:
+            gen = torch.Generator()
+            gen.manual_seed(self.seed + idx)
+            lr_tensor = self.pipeline(hr_tensor, return_meta=False, meta=None, generator=gen)
         return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
 
 # ================= 5. LoRA =================
@@ -559,7 +663,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     out_uncond = pixart(
                         x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
-                        mask=None, data_info=data_info, adapter_cond=cond,
+                        mask=None, data_info=data_info, adapter_cond=None,
                         injection_mode="hybrid", force_drop_ids=drop_uncond
                     )
                     out_cond = pixart(
@@ -614,7 +718,12 @@ def main():
     dl_gen = torch.Generator()
     dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
-    val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=VAL_LR_DIR, crop_size=512)
+    if VAL_MODE == "train_like":
+        val_ds = DF2K_Val_Degraded_Dataset(VAL_HR_DIR, crop_size=512, seed=SEED, deg_mode=TRAIN_DEG_MODE)
+    elif VAL_MODE == "lr_dir" and VAL_LR_DIR is not None:
+        val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=VAL_LR_DIR, crop_size=512)
+    else:
+        val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=None, crop_size=512)
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -669,7 +778,7 @@ def main():
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE)
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.sample() * vae.config.scaling_factor
-                zl = vae.encode(lr).latent_dist.sample() * vae.config.scaling_factor
+                zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
             t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(zh)
@@ -682,7 +791,7 @@ def main():
                     drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
                     drop_cond = torch.zeros(zt.shape[0], device=DEVICE)
                     out_uncond = pixart(
-                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond,
+                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=None,
                         injection_mode="hybrid", force_drop_ids=drop_uncond
                     )
                     out_cond = pixart(
@@ -726,7 +835,7 @@ def main():
                     with torch.no_grad():
                         if USE_CFG_TRAIN:
                             out2_uncond = pixart(
-                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=None,
                                 injection_mode="hybrid", force_drop_ids=drop_uncond
                             )
                             out2_cond = pixart(
@@ -764,8 +873,14 @@ def main():
                                 "blur_applied": deg["blur_applied"][b].cpu(),
                                 "k_size": deg["k_size"][b].cpu(),
                                 "sigma": deg["sigma"][b].cpu(),
+                                "sigma_x": deg["sigma_x"][b].cpu(),
+                                "sigma_y": deg["sigma_y"][b].cpu(),
+                                "theta": deg["theta"][b].cpu(),
                                 "noise_std": deg["noise_std"][b].cpu(),
                                 "noise": deg["noise"][b].cpu(),
+                                "resize_scale": deg["resize_scale"][b].cpu(),
+                                "resize_interp": deg["resize_interp"][b].cpu(),
+                                "jpeg_quality": deg["jpeg_quality"][b].cpu(),
                             }
                             lr_hat_b = train_ds.pipeline(img_full[b], return_meta=False, meta=meta_b)
                             lr_hat_list.append(lr_hat_b)
