@@ -78,7 +78,7 @@ BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 # Effective Batch = 16
 NUM_WORKERS = 8
 LR_BASE = 1e-5
-LORA_RANK = 64
+LORA_RANK = 16
 LORA_ALPHA = 64
 
 # [Curriculum Logic]
@@ -511,7 +511,7 @@ class LoRALinear(nn.Module):
 def apply_lora(model, rank=64, alpha=64):
     cnt = 0
     for name, module in model.named_modules():
-        if ("attn" in name or "cross" in name) and isinstance(module, nn.Linear):
+        if isinstance(module, nn.Linear) and any(key in name for key in ("qkv", "proj", "to_q", "to_k", "to_v")):
              parent = model.get_submodule(name.rsplit('.', 1)[0])
              child = name.rsplit('.', 1)[1]
              setattr(parent, child, LoRALinear(module, rank, alpha))

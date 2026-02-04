@@ -408,11 +408,16 @@ class PixArtMS(PixArt):
         # ==========================================================
         # Cross-Attn Injection
         # ==========================================================
-        self.adapter_proj = nn.Linear(hidden_size, hidden_size)
-        nn.init.xavier_uniform_(self.adapter_proj.weight)
-        nn.init.zeros_(self.adapter_proj.bias)
-
-        self.adapter_norm = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.adapter_proj_ms = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size) for _ in range(len(self.injection_layers))
+        ])
+        for proj in self.adapter_proj_ms:
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.zeros_(proj.bias)
+        self.adapter_norm_ms = nn.ModuleList([
+            nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) for _ in range(len(self.injection_layers))
+        ])
+        self.cross_gate_ms = nn.Parameter(torch.ones(len(self.injection_layers)))
         self.cross_attn_scale = nn.Parameter(torch.ones(1))
 
         self.initialize()
@@ -423,6 +428,12 @@ class PixArtMS(PixArt):
         # For AdaLN/FiLM stability, we want (shift, scale) to start as 0.
         # ----------------------------------------------------------
         for lin in self.input_adaln:
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+        self.input_res_proj = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size, bias=True) for _ in range(len(self.injection_layers))
+        ])
+        for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
 
@@ -496,12 +507,23 @@ class PixArtMS(PixArt):
         t0 = self.t_block(t)
         y = self.y_embedder(y, self.training, force_drop_ids=force_drop_ids)
 
-        # Cross-Attn Injection (取 adapter_features 的最后一个特征作为全局特征)
+        # Cross-Attn Injection (multi-scale with pooling)
         if len(adapter_features) > 0 and injection_mode in ['cross_attn', 'hybrid']:
-            vis_tokens = adapter_features[-1] # 使用最深层特征
-            vis_tokens = self.adapter_proj(vis_tokens)
-            vis_tokens = self.adapter_norm(vis_tokens)
-            vis_tokens = vis_tokens * self.cross_attn_scale 
+            pool_hw = [16, 16, 8, 8]
+            vis_list = []
+            for s, feat in enumerate(adapter_features[:len(self.injection_layers)]):
+                if feat.shape[1] == 1024:
+                    bsz = feat.shape[0]
+                    feat_img = feat.view(bsz, 32, 32, feat.shape[-1]).permute(0, 3, 1, 2)
+                    feat_img = F.adaptive_avg_pool2d(feat_img, (pool_hw[s], pool_hw[s]))
+                    feat_p = feat_img.permute(0, 2, 3, 1).reshape(bsz, pool_hw[s] * pool_hw[s], feat.shape[-1])
+                else:
+                    feat_p = feat
+                v = self.adapter_proj_ms[s](feat_p)
+                v = self.adapter_norm_ms[s](v)
+                v = v * self.cross_attn_scale * self.cross_gate_ms[s]
+                vis_list.append(v)
+            vis_tokens = torch.cat(vis_list, dim=1)
             if y.dim() == 4:
                 vis_tokens = vis_tokens.unsqueeze(1)
                 concat_dim = 2
@@ -540,6 +562,8 @@ class PixArtMS(PixArt):
                     sb = self.input_adaln[scale_idx](feat_tokens.float())  # [B, N, 2C]
                     adaln_shift, adaln_scale = sb.chunk(2, dim=-1)
 
+                res = self.input_res_proj[scale_idx](feat_tokens)
+                x = x + alpha * res
                 x = auto_grad_checkpoint(
                     block,
                     x,
