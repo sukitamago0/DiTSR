@@ -720,31 +720,30 @@ def main():
                 loss_l1 = F.l1_loss(img_p, img_t)
 
                 # --- Noise-level consistency (z0 consistency across t1/t2) ---
-                if USE_NOISE_CONSISTENCY and w.get("noise_cons", 0.0) > 0 and torch.rand(()) < NOISE_CONS_PROB:
+                if USE_NOISE_CONSISTENCY and w.get("noise_cons", 0.0) > 0 and torch.rand((), device=DEVICE) < NOISE_CONS_PROB:
                     t2 = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
                     zt2 = diffusion.q_sample(zh, t2, noise)
-                    if USE_CFG_TRAIN:
-                        out2_uncond = pixart(
-                            x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
-                            injection_mode="hybrid", force_drop_ids=drop_uncond
-                        )
-                        out2_cond = pixart(
-                            x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
-                            injection_mode="hybrid", force_drop_ids=drop_cond
-                        )
-                        if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
-                        if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
-                        eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
-                    else:
-                        out2 = pixart(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
-                        if out2.shape[1] == 8: out2, _ = out2.chunk(2, dim=1)
-                        eps2 = out2.float()
-
                     with torch.no_grad():
+                        if USE_CFG_TRAIN:
+                            out2_uncond = pixart(
+                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                                injection_mode="hybrid", force_drop_ids=drop_uncond
+                            )
+                            out2_cond = pixart(
+                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                                injection_mode="hybrid", force_drop_ids=drop_cond
+                            )
+                            if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
+                            if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
+                            eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
+                        else:
+                            out2 = pixart(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
+                            if out2.shape[1] == 8: out2, _ = out2.chunk(2, dim=1)
+                            eps2 = out2.float()
                         c1b = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t2, zt2.shape)
                         c2b = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t2, zt2.shape)
-                    z0_t2 = c1b * zt2.float() - c2b * eps2
-                    loss_noise_cons = F.l1_loss(z0, z0_t2.detach())
+                        z0_t2 = c1b * zt2.float() - c2b * eps2
+                    loss_noise_cons = F.l1_loss(z0, z0_t2)
                 else:
                     loss_noise_cons = torch.tensor(0.0, device=DEVICE)
 
