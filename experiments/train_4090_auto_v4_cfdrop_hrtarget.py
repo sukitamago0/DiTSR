@@ -60,7 +60,7 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = os.path.join(PROJECT_ROOT, "output", "quality_embed.pth")
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v4")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v4_cfdrop_hrtarget_lrcons")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -102,14 +102,18 @@ TRAIN_DEG_MODE = "highorder"  # "bicubic" / "highorder"
 CFG_SCALE = 3.0
 USE_LQ_INIT = False
 INIT_NOISE_STD = 0.0
-USE_CFG_TRAIN = True
+USE_CFG_TRAIN = False
 CFG_TRAIN_SCALE = 3.0
+USE_ADAPTER_CFDROPOUT = True  # adapter-only classifier-free dropout (train-time)
+COND_DROP_PROB = 0.10         # probability to drop adapter condition per-sample
+FORCE_KEEP_TEXT = True        # keep text token-drop disabled (force_drop_ids=0)
 USE_NOISE_CONSISTENCY = True
 NOISE_CONS_WARMUP = 2000
 NOISE_CONS_RAMP = 6000
 NOISE_CONS_WEIGHT = 0.1
 NOISE_CONS_PROB = 0.5
-USE_LR_CONSISTENCY = False
+USE_LR_CONSISTENCY = True
+LR_CONS_PROB = 0.25  # compute strict LR-consistency loss with this probability
 LR_CONS_WARMUP = 1000
 LR_CONS_RAMP = 5000
 LR_CONS_WEIGHT = 0.5
@@ -192,6 +196,33 @@ def randn_like_with_generator(tensor, generator):
         generator=generator,
     )
 
+
+def mask_adapter_cond(cond, keep_mask: torch.Tensor):
+    """Mask adapter condition per-sample.
+    cond can be a Tensor or a (list/tuple) of Tensors (multi-scale).
+    keep_mask: [B] float/bool where 1=keep, 0=drop.
+    """
+    if cond is None:
+        return None
+    if not torch.is_tensor(keep_mask):
+        keep_mask = torch.tensor(keep_mask)
+    # ensure float mask on the same device
+    keep_mask = keep_mask.to(device=(cond.device if torch.is_tensor(cond) else cond[0].device), dtype=torch.float32)
+
+    def _mask(x: torch.Tensor):
+        m = keep_mask
+        while m.ndim < x.ndim:
+            m = m.unsqueeze(-1)
+        return x * m.to(dtype=x.dtype)
+
+    if torch.is_tensor(cond):
+        return _mask(cond)
+    if isinstance(cond, (list, tuple)):
+        masked = [_mask(c) for c in cond]
+        return masked if isinstance(cond, list) else tuple(masked)
+    # fallback (unexpected type)
+    return cond
+
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
@@ -220,12 +251,16 @@ def get_config_snapshot():
         "init_noise_std": INIT_NOISE_STD,
         "use_cfg_train": USE_CFG_TRAIN,
         "cfg_train_scale": CFG_TRAIN_SCALE,
+        "use_adapter_cfdropout": USE_ADAPTER_CFDROPOUT,
+        "cond_drop_prob": COND_DROP_PROB,
+        "force_keep_text": FORCE_KEEP_TEXT,
         "use_noise_consistency": USE_NOISE_CONSISTENCY,
         "noise_cons_warmup": NOISE_CONS_WARMUP,
         "noise_cons_ramp": NOISE_CONS_RAMP,
         "noise_cons_weight": NOISE_CONS_WEIGHT,
         "noise_cons_prob": NOISE_CONS_PROB,
         "use_lr_consistency": USE_LR_CONSISTENCY,
+        "lr_cons_prob": LR_CONS_PROB,
         "lr_cons_warmup": LR_CONS_WARMUP,
         "lr_cons_ramp": LR_CONS_RAMP,
         "lr_cons_weight": LR_CONS_WEIGHT,
@@ -286,6 +321,7 @@ class DegradationPipeline:
         return img.squeeze(0)
 
     def _apply_jpeg(self, img, quality):
+        img = img.detach().to(torch.float32)  # ★关键：numpy 不支持 BF16
         img_np = (img.clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
         buf = io.BytesIO()
         Image.fromarray(img_np).save(buf, format="JPEG", quality=int(quality))
@@ -398,6 +434,41 @@ class DegradationPipeline:
 
         def apply_ops(img_in, ops, params):
             out = img_in
+
+            def _match_chw(t, ref):
+                """Center crop/pad a [C,H,W] tensor t to match ref shape. Used to avoid rare 1px mismatch in strict replay."""
+                if t is None:
+                    return torch.zeros_like(ref)
+                if t.shape == ref.shape:
+                    return t
+                # Channel align (rare, but keep safe)
+                if t.shape[0] != ref.shape[0]:
+                    c = min(int(t.shape[0]), int(ref.shape[0]))
+                    t = t[:c]
+                    if c < ref.shape[0]:
+                        pad_c = int(ref.shape[0] - c)
+                        t = torch.cat([t, torch.zeros((pad_c, t.shape[1], t.shape[2]), device=t.device, dtype=t.dtype)], dim=0)
+                H, W = int(ref.shape[1]), int(ref.shape[2])
+                h, w = int(t.shape[1]), int(t.shape[2])
+                # Height
+                if h > H:
+                    top = (h - H) // 2
+                    t = t[:, top:top+H, :]
+                elif h < H:
+                    pad_top = (H - h) // 2
+                    pad_bottom = (H - h) - pad_top
+                    t = F.pad(t, (0, 0, pad_top, pad_bottom))
+                # Width
+                h, w = int(t.shape[1]), int(t.shape[2])
+                if w > W:
+                    left = (w - W) // 2
+                    t = t[:, :, left:left+W]
+                elif w < W:
+                    pad_left = (W - w) // 2
+                    pad_right = (W - w) - pad_left
+                    t = F.pad(t, (pad_left, pad_right, 0, 0))
+                return t
+
             stage_noise = None
             for op in ops:
                 if op == "blur" and params["blur_applied"]:
@@ -406,8 +477,8 @@ class DegradationPipeline:
                     else:
                         out = TF.gaussian_blur(out, params["k_size"], [params["sigma"], params["sigma"]])
                 elif op == "resize":
-                    mid_h = max(1, int(self.crop_size * params["resize_scale"]))
-                    mid_w = max(1, int(self.crop_size * params["resize_scale"]))
+                    mid_h = max(1, int(round(self.crop_size * params["resize_scale"])))
+                    mid_w = max(1, int(round(self.crop_size * params["resize_scale"])))
                     out = TF.resize(out, [mid_h, mid_w], interpolation=params["resize_interp"], antialias=True)
                 elif op == "noise":
                     if params["noise_std"] > 0:
@@ -427,6 +498,7 @@ class DegradationPipeline:
                                 noise = torch.zeros_like(out)
                             else:
                                 noise = noise.to(out.device, dtype=out.dtype)
+                                noise = _match_chw(noise, out)
                         stage_noise = noise
                         out = (out + noise * params["noise_std"]).clamp(0.0, 1.0)
                     else:
@@ -997,6 +1069,16 @@ def main():
 
             cond = adapter(zl.float())
 
+            # --- Adapter-only classifier-free dropout (per-sample) ---
+            # We keep text conditioning fixed, and randomly drop ONLY the adapter condition.
+            cond_in = cond
+            if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
+                keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
+                cond_in = mask_adapter_cond(cond, keep)
+
+            # Optionally disable PixArt's internal text token-drop for stability.
+            force_drop_ids = torch.zeros((zt.shape[0],), device=DEVICE) if FORCE_KEEP_TEXT else None
+
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 if USE_CFG_TRAIN:
                     drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
@@ -1013,7 +1095,10 @@ def main():
                     if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
                     eps = out_uncond + CFG_TRAIN_SCALE * (out_cond - out_uncond)
                 else:
-                    out = pixart(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
+                    kwargs = dict(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                    if FORCE_KEEP_TEXT:
+                        kwargs["force_drop_ids"] = force_drop_ids
+                    out = pixart(**kwargs)
                     if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
                     eps = out.float()
 
@@ -1035,7 +1120,9 @@ def main():
                 zh_c = zh.float()[..., top:top+32, left:left+32]
 
                 img_p = vae.decode(z0_c/vae.config.scaling_factor).sample.clamp(-1,1)
-                img_t = vae.decode(zh_c/vae.config.scaling_factor).sample.clamp(-1,1)
+                # IMPORTANT: use real HR pixel patch as target (not VAE-reconstructed HR)
+                y0 = int(top) * 8; x0 = int(left) * 8
+                img_t = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
 
                 loss_l1 = F.l1_loss(img_p, img_t)
 
@@ -1057,7 +1144,10 @@ def main():
                             if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
                             eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
                         else:
-                            out2 = pixart(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond, injection_mode="hybrid")
+                            kwargs2 = dict(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                            if FORCE_KEEP_TEXT:
+                                kwargs2["force_drop_ids"] = force_drop_ids
+                            out2 = pixart(**kwargs2)
                             if out2.shape[1] == 8: out2, _ = out2.chunk(2, dim=1)
                             eps2 = out2.float()
                         c1b = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t2, zt2.shape)
@@ -1069,7 +1159,7 @@ def main():
 
                 # --- Strict LR consistency (optional) ---
                 # Decode FULL z0 (64x64 latent -> 512x512 image) to keep degradation context consistent.
-                if USE_LR_CONSISTENCY and w.get("cons", 0.0) > 0:
+                if USE_LR_CONSISTENCY and w.get("cons", 0.0) > 0 and (torch.rand((), device=DEVICE) < LR_CONS_PROB):
                     img_full = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
                     # Replay degradation on pred using per-sample meta from dataset
                     deg = batch.get("deg", None)
@@ -1081,7 +1171,7 @@ def main():
                         lr_hat_list = []
                         for b in range(img_full.shape[0]):
                             meta_b = build_stage_meta_from_deg(deg, b)
-                            img_cpu = img_full[b].detach().cpu()
+                            img_cpu = img_full[b].detach().float().cpu()  # ensure float32 for CPU degradation replay
                             lr_hat_b = train_ds.pipeline(img_cpu, return_meta=False, meta=meta_b)
                             lr_hat_b = lr_hat_b.to(DEVICE)
                             lr_hat_list.append(lr_hat_b)

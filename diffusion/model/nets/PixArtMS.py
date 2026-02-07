@@ -172,7 +172,7 @@ class PixArtMS(PixArt):
             nn.init.zeros_(lin.bias)
         nn.init.zeros_(self.adapter_alpha_mlp[-1].weight)
         nn.init.zeros_(self.adapter_alpha_mlp[-1].bias)
-        nn.init.zeros_(self.cross_gate_ms)
+        nn.init.constant_(self.cross_gate_ms, 0.1)
 
     def forward(
         self,
