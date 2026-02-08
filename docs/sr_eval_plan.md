@@ -25,6 +25,37 @@ STEPS=50 \
 ./scripts/run_sr_eval_plan.sh
 ```
 
+## 重要：明确 SR 任务输入（lq128 vs lq512）
+
+默认 `eval_valpack_ditsr.py` 会自动选 pack 里的 LR 目录，优先 lq512（同分辨率退化）。
+如果你要严格做 **x4 SR**，请用以下参数强制使用 lq128：
+
+```bash
+python experiments/eval_valpack_ditsr.py \
+  --train_module train_4090_auto_v4_cfdrop_hrtarget \
+  --ckpt /path/to/ckpt.pth \
+  --pack_dir /path/to/valpack \
+  --lr_dir_name lq128 \
+  --mode adapter_only \
+  --cfg 3.0 \
+  --steps 50
+```
+
+## 重要：用重建式初始化验证（LQ-init + 去文本）
+
+若你在复原任务里遇到彩噪/色偏，可用以下参数验证“重建式推理”是否有效：
+
+```bash
+python experiments/eval_valpack_ditsr.py \
+  --train_module train_4090_auto_v4_cfdrop_hrtarget \
+  --ckpt /path/to/ckpt.pth \
+  --pack_dir /path/to/valpack \
+  --mode adapter_only \
+  --force_use_lq_init 1 \
+  --force_init_noise_std 0.05 \
+  --force_drop_text 1
+```
+
 ### 仅测 v4（不测 cfdrop）
 
 ```bash
