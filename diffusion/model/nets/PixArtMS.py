@@ -330,7 +330,7 @@ class PixArtMS(PixArt):
     def forward_with_cfg(self, x, timestep, y, cfg_scale, data_info, **kwargs):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, timestep, y, data_info=data_info)
+        model_out = self.forward(combined, timestep, y, data_info=data_info, **kwargs)
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
