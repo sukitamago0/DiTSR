@@ -104,6 +104,7 @@ TRAIN_DEG_MODE = "highorder"  # "bicubic" / "highorder"
 CFG_SCALE = 3.0
 USE_LQ_INIT = True
 INIT_NOISE_STD = 0.05
+LQ_INIT_STRENGTH = 0.5  # 0~1, start from this noise level when using LQ-init
 USE_CFG_TRAIN = True
 CFG_TRAIN_SCALE = 3.0
 USE_ADAPTER_CFDROPOUT = True  # adapter-only classifier-free dropout (train-time)
@@ -206,6 +207,91 @@ def randn_like_with_generator(tensor, generator):
     )
 
 
+def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
+    """Img2img-style init: add noise at a start timestep and run remaining steps."""
+    strength = float(max(0.0, min(1.0, strength)))
+    scheduler.set_timesteps(steps, device=z_lr.device)
+    timesteps = scheduler.timesteps
+    start_index = int(round(strength * (len(timesteps) - 1)))
+    start_index = min(max(start_index, 0), len(timesteps) - 1)
+    t_start = timesteps[start_index]
+    noise = randn_like_with_generator(z_lr, generator)
+    if hasattr(scheduler, "add_noise"):
+        latents = scheduler.add_noise(z_lr, noise, t_start)
+    else:
+        latents = z_lr + noise
+    return latents.to(dtype=dtype), timesteps[start_index:]
+
+
+def differentiable_degrade_patch(img, meta, pipeline):
+    """Differentiable replay: only blur/resize/noise (skip JPEG)."""
+    img = (img + 1.0) * 0.5  # [-1,1] -> [0,1]
+    ops_stage1 = [op for op in str(meta.get("ops_stage1", ",".join(DEG_OPS))).split(",") if op]
+    ops_stage2 = [op for op in str(meta.get("ops_stage2", "")).split(",") if op]
+    use_two_stage = bool(int(meta.get("use_two_stage", torch.tensor(0)).item()))
+    stage1 = {
+        "blur_applied": bool(int(meta["stage1_blur_applied"].item())),
+        "k_size": int(meta["stage1_k_size"].item()),
+        "sigma": float(meta["stage1_sigma"].item()),
+        "sigma_x": float(meta["stage1_sigma_x"].item()),
+        "sigma_y": float(meta["stage1_sigma_y"].item()),
+        "theta": float(meta["stage1_theta"].item()),
+        "resize_scale": float(meta["stage1_resize_scale"].item()),
+        "resize_interp_idx": int(meta["stage1_resize_interp"].item()),
+        "resize_interp": RESIZE_INTERP_MODES[int(meta["stage1_resize_interp"].item())],
+        "noise_std": float(meta["stage1_noise_std"].item()),
+        "noise": meta.get("stage1_noise", None),
+    }
+    stage2 = None
+    if use_two_stage:
+        stage2 = {
+            "blur_applied": bool(int(meta["stage2_blur_applied"].item())),
+            "k_size": int(meta["stage2_k_size"].item()),
+            "sigma": float(meta["stage2_sigma"].item()),
+            "sigma_x": float(meta["stage2_sigma_x"].item()),
+            "sigma_y": float(meta["stage2_sigma_y"].item()),
+            "theta": float(meta["stage2_theta"].item()),
+            "resize_scale": float(meta["stage2_resize_scale"].item()),
+            "resize_interp_idx": int(meta["stage2_resize_interp"].item()),
+            "resize_interp": RESIZE_INTERP_MODES[int(meta["stage2_resize_interp"].item())],
+            "noise_std": float(meta["stage2_noise_std"].item()),
+            "noise": meta.get("stage2_noise", None),
+        }
+
+    def apply_ops(img_in, ops, params):
+        out = img_in
+        for op in ops:
+            if op == "blur" and params["blur_applied"]:
+                if params["sigma_x"] > 0 and params["sigma_y"] > 0:
+                    out = pipeline._apply_aniso_blur(out, params["k_size"], params["sigma_x"], params["sigma_y"], params["theta"])
+                else:
+                    out = TF.gaussian_blur(out, params["k_size"], [params["sigma"], params["sigma"]])
+            elif op == "resize":
+                mid_h = max(1, int(round(pipeline.crop_size * params["resize_scale"])))
+                mid_w = max(1, int(round(pipeline.crop_size * params["resize_scale"])))
+                out = TF.resize(out, [mid_h, mid_w], interpolation=params["resize_interp"], antialias=True)
+            elif op == "noise":
+                if params["noise_std"] > 0:
+                    if params.get("noise") is not None:
+                        noise = params["noise"].to(out.device, dtype=out.dtype)
+                        if noise.shape != out.shape:
+                            noise = noise[: out.shape[0], : out.shape[1], : out.shape[2]]
+                    else:
+                        noise = torch.randn_like(out)
+                    out = (out + noise * params["noise_std"]).clamp(0.0, 1.0)
+            # skip JPEG to keep differentiable
+        return out
+
+    lr_small = apply_ops(img, ops_stage1, stage1)
+    if use_two_stage and stage2 is not None:
+        lr_small = apply_ops(lr_small, ops_stage2, stage2)
+    down_h = int(pipeline.crop_size * pipeline.downscale_factor)
+    down_w = int(pipeline.crop_size * pipeline.downscale_factor)
+    lr_small = TF.resize(lr_small, [down_h, down_w], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+    lr = TF.resize(lr_small, [pipeline.crop_size, pipeline.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+    return (lr * 2.0 - 1.0).clamp(-1.0, 1.0)
+
+
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     """Mask adapter condition per-sample.
     cond can be a Tensor or a (list/tuple) of Tensors (multi-scale).
@@ -260,6 +346,7 @@ def get_config_snapshot():
         "cfg_scale": CFG_SCALE,
         "use_lq_init": USE_LQ_INIT,
         "init_noise_std": INIT_NOISE_STD,
+        "lq_init_strength": LQ_INIT_STRENGTH,
         "use_cfg_train": USE_CFG_TRAIN,
         "cfg_train_scale": CFG_TRAIN_SCALE,
         "use_adapter_cfdropout": USE_ADAPTER_CFDROPOUT,
@@ -275,6 +362,9 @@ def get_config_snapshot():
         "lr_cons_warmup": LR_CONS_WARMUP,
         "lr_cons_ramp": LR_CONS_RAMP,
         "lr_cons_weight": LR_CONS_WEIGHT,
+        "lr_cons_mode": LR_CONS_MODE,
+        "lr_cons_full_every": LR_CONS_FULL_EVERY,
+        "vae_tiling": VAE_TILING,
         "deg_ops": DEG_OPS,
         "p_two_stage": P_TWO_STAGE,
         "resize_scale_range": RESIZE_SCALE_RANGE,
@@ -961,16 +1051,17 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
-            # Deterministic init: LQ-init (optional) or fixed noise.
+            # Deterministic init: img2img-style LQ-init (aligned to scheduler) or fixed noise.
             if USE_LQ_INIT:
-                latents = z_lr.clone()
-                if INIT_NOISE_STD > 0:
-                    latents = latents + INIT_NOISE_STD * randn_like_with_generator(latents, val_gen)
+                latents, run_timesteps = get_lq_init_latents(
+                    z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE
+                )
             else:
                 latents = randn_like_with_generator(z_hr, val_gen)
+                run_timesteps = scheduler.timesteps
             cond = adapter(z_lr.float())
 
-            for t in scheduler.timesteps:
+            for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     if FORCE_DROP_TEXT:
@@ -1147,7 +1238,7 @@ def main():
                         injection_mode="hybrid", force_drop_ids=drop_uncond
                     )
                     out_cond = pixart(
-                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond,
+                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in,
                         injection_mode="hybrid", force_drop_ids=drop_cond
                     )
                     if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
@@ -1196,7 +1287,7 @@ def main():
                                 injection_mode="hybrid", force_drop_ids=drop_uncond
                             )
                             out2_cond = pixart(
-                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
+                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in,
                                 injection_mode="hybrid", force_drop_ids=drop_cond
                             )
                             if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
@@ -1249,9 +1340,8 @@ def main():
                             lr_hat_list = []
                             for b in range(img_p.shape[0]):
                                 meta_b = build_stage_meta_from_deg(deg, b)
-                                img_cpu = img_p[b].detach().float().cpu()  # patch-sized replay (256x256)
-                                lr_hat_b = patch_pipeline(img_cpu, return_meta=False, meta=meta_b)
-                                lr_hat_b = lr_hat_b.to(DEVICE)
+                                img_patch = img_p[b].float()  # patch-sized replay (256x256), keep grad
+                                lr_hat_b = differentiable_degrade_patch(img_patch, meta_b, patch_pipeline)
                                 lr_hat_list.append(lr_hat_b)
                             lr_hat = torch.stack(lr_hat_list, dim=0).to(DEVICE)
                             # Compare patch-sized LR
