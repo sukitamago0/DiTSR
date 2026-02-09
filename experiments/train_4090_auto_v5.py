@@ -1029,6 +1029,8 @@ def main():
     dl_gen = torch.Generator()
     dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
+    # Smaller degradation pipeline for patch-level LR consistency (avoids full 512 decode OOM).
+    patch_pipeline = DegradationPipeline(crop_size=256)
     if VAL_MODE == "valpack":
         val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
     elif VAL_MODE == "train_like":
@@ -1206,30 +1208,25 @@ def main():
                     loss_noise_cons = torch.tensor(0.0, device=DEVICE)
 
                 # --- Strict LR consistency (optional) ---
-                # Decode FULL z0 (64x64 latent -> 512x512 image) to keep degradation context consistent.
+                # Use patch-level degradation replay to avoid full 512 decode OOM.
                 if USE_LR_CONSISTENCY and w.get("cons", 0.0) > 0 and (torch.rand((), device=DEVICE) < LR_CONS_PROB):
-                    img_full = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
-                    # Replay degradation on pred using per-sample meta from dataset
                     deg = batch.get("deg", None)
                     if deg is None:
                         # Should not happen in training dataset; keep safe
                         loss_cons = torch.tensor(0.0, device=DEVICE)
                     else:
-                        # Apply degradation per sample (supports batch dimension)
                         lr_hat_list = []
-                        for b in range(img_full.shape[0]):
+                        for b in range(img_p.shape[0]):
                             meta_b = build_stage_meta_from_deg(deg, b)
-                            img_cpu = img_full[b].detach().float().cpu()  # ensure float32 for CPU degradation replay
-                            lr_hat_b = train_ds.pipeline(img_cpu, return_meta=False, meta=meta_b)
+                            img_cpu = img_p[b].detach().float().cpu()  # patch-sized replay (256x256)
+                            lr_hat_b = patch_pipeline(img_cpu, return_meta=False, meta=meta_b)
                             lr_hat_b = lr_hat_b.to(DEVICE)
                             lr_hat_list.append(lr_hat_b)
                         lr_hat = torch.stack(lr_hat_list, dim=0).to(DEVICE)
-
-                        # Match the SAME spatial region as the decoded patch (latent crop -> image crop).
+                        # Compare patch-sized LR
                         y0 = top * 8; x0 = left * 8
-                        lr_hat_p = lr_hat[..., y0:y0+256, x0:x0+256]
                         lr_in_p  = lr[..., y0:y0+256, x0:x0+256]
-                        loss_cons = F.l1_loss(lr_hat_p, lr_in_p)
+                        loss_cons = F.l1_loss(lr_hat, lr_in_p)
                 else:
                     loss_cons = torch.tensor(0.0, device=DEVICE)
 
