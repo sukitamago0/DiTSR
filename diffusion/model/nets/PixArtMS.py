@@ -153,6 +153,14 @@ class PixArtMS(PixArt):
         ])
         self.cross_gate_ms = nn.Parameter(torch.ones(len(self.injection_layers)))
         self.cross_attn_scale = nn.Parameter(torch.ones(1))
+        # V6: style-only AdaLN head (no spatial residual)
+        self.style_adaln = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
+        nn.init.zeros_(self.style_adaln[-1].weight)
+        nn.init.zeros_(self.style_adaln[-1].bias)
+        self.sparse_inject_ratio = 0.5
 
         self.initialize()
 
@@ -217,10 +225,15 @@ class PixArtMS(PixArt):
         # [核心修改] Adapter 特征预处理 (支持 List 或 Tensor)
         # --------------------------------------------------------
         adapter_features = [] # 用于存储处理后的特征列表
+        style_vec = None
         
         if adapter_cond is not None:
             # 1. 如果是列表 (Multi-Scale Adapter 输出)
             if isinstance(adapter_cond, list):
+                # if the last item is a style vector, detach it from spatial tokens
+                if adapter_cond and adapter_cond[-1].dim() == 2:
+                    style_vec = adapter_cond[-1]
+                    adapter_cond = adapter_cond[:-1]
                 for feat in adapter_cond:
                     # Flatten: [B, C, H, W] -> [B, N, C]
                     feat_flat = feat.flatten(2).transpose(1, 2)
@@ -234,7 +247,7 @@ class PixArtMS(PixArt):
                 feat_flat = adapter_cond.flatten(2).transpose(1, 2)
                 with torch.cuda.amp.autocast(enabled=False):
                     feat_flat = self.input_adapter_ln(feat_flat.float())
-                # 复制 4 份，填满 injection_layers
+                # 复制到与 injection_layers 数量一致
                 adapter_features = [feat_flat] * len(self.injection_layers)
 
         t = self.t_embedder(timestep)
@@ -291,31 +304,64 @@ class PixArtMS(PixArt):
             #          -> AdaLN/FiLM on norm1(x) inside the block
             # --------------------------------------------------------
             if len(adapter_features) > 0 and injection_mode in ['input', 'hybrid'] and i in self.injection_layers:
-                scale_idx = self.injection_layers.index(i)  # 0/1/2/3
+                scale_idx = self.injection_layers.index(i)
                 alpha = self.injection_scales[scale_idx] * alpha_dynamic[:, scale_idx].view(-1, 1, 1)
 
-                # choose the matching scale feature; fallback to the deepest
-                feat_idx = scale_idx if scale_idx < len(adapter_features) else -1
-                feat_tokens = adapter_features[feat_idx]
+                # V6 inverted pyramid mapping
+                if i in (0, 4):
+                    feat_idx = 0 if i == 0 else 1
+                elif i in (7, 10):
+                    feat_idx = 2
+                elif i in (14, 18):
+                    feat_idx = 3
+                elif i in (21,):
+                    feat_idx = 3
+                else:
+                    feat_idx = None
 
-                # produce token-wise (shift, scale)
-                with torch.cuda.amp.autocast(enabled=False):
-                    sb = self.input_adaln[scale_idx](feat_tokens.float())  # [B, N, 2C]
-                    adaln_shift, adaln_scale = sb.chunk(2, dim=-1)
+                if feat_idx is None and style_vec is not None:
+                    # Style-only AdaLN (no spatial residual) for deep refinement.
+                    with torch.cuda.amp.autocast(enabled=False):
+                        sb = self.style_adaln(style_vec.float())
+                        adaln_shift, adaln_scale = sb.chunk(2, dim=-1)
+                    adaln_shift = adaln_shift.unsqueeze(1).expand(-1, x.shape[1], -1)
+                    adaln_scale = adaln_scale.unsqueeze(1).expand(-1, x.shape[1], -1)
+                    x = auto_grad_checkpoint(
+                        block,
+                        x,
+                        y,
+                        t0,
+                        y_lens,
+                        adaln_shift=adaln_shift,
+                        adaln_scale=adaln_scale,
+                        adaln_alpha=alpha,
+                        **kwargs,
+                    )
+                else:
+                    # spatial injection with optional sparse masking
+                    feat_tokens = adapter_features[feat_idx]
+                    if self.training and i in (21,):
+                        mask_ratio = self.sparse_inject_ratio
+                        keep = (torch.rand(feat_tokens.shape[0], feat_tokens.shape[1], 1, device=feat_tokens.device) > mask_ratio)
+                        feat_tokens = feat_tokens * keep / (1.0 - mask_ratio)
 
-                res = self.input_res_proj[scale_idx](feat_tokens)
-                x = x + alpha * res
-                x = auto_grad_checkpoint(
-                    block,
-                    x,
-                    y,
-                    t0,
-                    y_lens,
-                    adaln_shift=adaln_shift,
-                    adaln_scale=adaln_scale,
-                    adaln_alpha=alpha,
-                    **kwargs,
-                )
+                    with torch.cuda.amp.autocast(enabled=False):
+                        sb = self.input_adaln[scale_idx](feat_tokens.float())
+                        adaln_shift, adaln_scale = sb.chunk(2, dim=-1)
+
+                    res = self.input_res_proj[scale_idx](feat_tokens)
+                    x = x + alpha * res
+                    x = auto_grad_checkpoint(
+                        block,
+                        x,
+                        y,
+                        t0,
+                        y_lens,
+                        adaln_shift=adaln_shift,
+                        adaln_scale=adaln_scale,
+                        adaln_alpha=alpha,
+                        **kwargs,
+                    )
             else:
                 x = auto_grad_checkpoint(block, x, y, t0, y_lens, **kwargs)
 
