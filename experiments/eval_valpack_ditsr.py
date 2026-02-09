@@ -242,6 +242,7 @@ def main():
     # follow your train module init style
     use_lq_init = bool(getattr(M, "USE_LQ_INIT", False))
     init_noise_std = float(getattr(M, "INIT_NOISE_STD", 0.0))
+    lq_init_strength = float(getattr(M, "LQ_INIT_STRENGTH", 0.0))
     if args.force_use_lq_init >= 0:
         use_lq_init = bool(args.force_use_lq_init)
     if args.force_init_noise_std is not None:
@@ -271,15 +272,22 @@ def main():
                 z_lr = z_lr.to("cuda")
 
             if use_lq_init:
-                latents = z_lr.clone()
-                if init_noise_std > 0:
-                    latents = latents + init_noise_std * M.randn_like_with_generator(latents, val_gen)
+                if hasattr(M, "get_lq_init_latents"):
+                    latents, run_timesteps = M.get_lq_init_latents(
+                        z_lr, scheduler, args.steps, val_gen, lq_init_strength, z_lr.dtype
+                    )
+                else:
+                    latents = z_lr.clone()
+                    if init_noise_std > 0:
+                        latents = latents + init_noise_std * M.randn_like_with_generator(latents, val_gen)
+                    run_timesteps = scheduler.timesteps
             else:
                 latents = M.randn_like_with_generator(z_hr, val_gen)
+                run_timesteps = scheduler.timesteps
 
             cond = adapter(z_lr.float())
 
-            for t in scheduler.timesteps:
+            for t in run_timesteps:
                 t_b = torch.tensor([t], device="cuda").expand(latents.shape[0])
 
                 with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_autocast):
@@ -356,6 +364,7 @@ def main():
         "force_drop_text": bool(args.force_drop_text),
         "force_use_lq_init": use_lq_init,
         "force_init_noise_std": init_noise_std,
+        "lq_init_strength": lq_init_strength,
         "n": len(names),
         "pred_dir": str(pred_dir),
         "save_pred_only": args.save_pred_only,
