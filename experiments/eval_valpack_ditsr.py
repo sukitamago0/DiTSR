@@ -148,6 +148,11 @@ def main():
     ap.add_argument("--vae_device", type=str, default="cpu", choices=["cuda", "cpu"])
     ap.add_argument("--save_pred_only", type=int, default=1, choices=[0, 1])
     ap.add_argument("--out_dir", type=str, default=None)
+    ap.add_argument("--lr_dir_name", type=str, default=None, choices=["lq512", "lq128"])
+    ap.add_argument("--lr_dir", type=str, default=None)
+    ap.add_argument("--force_drop_text", type=int, default=0, choices=[0, 1])
+    ap.add_argument("--force_use_lq_init", type=int, default=-1, choices=[-1, 0, 1])
+    ap.add_argument("--force_init_noise_std", type=float, default=None)
     args = ap.parse_args()
 
     # path setup to import train scripts in experiments/
@@ -164,7 +169,14 @@ def main():
     compute_dtype = _dtype_from_str(args.autocast_dtype)
     use_autocast = (compute_dtype != torch.float32)
 
-    hr_dir, lr_dir = _pick_hr_lr(args.pack_dir)
+    if args.lr_dir is not None:
+        hr_dir, _ = _pick_hr_lr(args.pack_dir)
+        lr_dir = args.lr_dir
+    elif args.lr_dir_name is not None:
+        hr_dir, _ = _pick_hr_lr(args.pack_dir)
+        lr_dir = str(Path(args.pack_dir) / args.lr_dir_name)
+    else:
+        hr_dir, lr_dir = _pick_hr_lr(args.pack_dir)
     hr_map = _list_stems(hr_dir)
     lr_map = _list_stems(lr_dir)
     names = sorted(list(set(hr_map.keys()).intersection(lr_map.keys())))[: args.max_n]
@@ -230,6 +242,10 @@ def main():
     # follow your train module init style
     use_lq_init = bool(getattr(M, "USE_LQ_INIT", False))
     init_noise_std = float(getattr(M, "INIT_NOISE_STD", 0.0))
+    if args.force_use_lq_init >= 0:
+        use_lq_init = bool(args.force_use_lq_init)
+    if args.force_init_noise_std is not None:
+        init_noise_std = float(args.force_init_noise_std)
 
     with torch.inference_mode():
         for i, name in enumerate(tqdm(names, desc="DiTSR valpack inference")):
@@ -273,6 +289,9 @@ def main():
                     else:  # adapter_only
                         drop_uncond = torch.zeros(latents.shape[0], device="cuda")
                         drop_cond = torch.zeros(latents.shape[0], device="cuda")
+                    if args.force_drop_text:
+                        drop_uncond = torch.ones(latents.shape[0], device="cuda")
+                        drop_cond = torch.ones(latents.shape[0], device="cuda")
 
                     out_uncond = pixart(
                         x=latents.to(compute_dtype) if use_autocast else latents,
@@ -332,6 +351,11 @@ def main():
         "seed": args.seed,
         "autocast_dtype": args.autocast_dtype,
         "vae_device": args.vae_device,
+        "lr_dir_name": args.lr_dir_name,
+        "lr_dir": args.lr_dir,
+        "force_drop_text": bool(args.force_drop_text),
+        "force_use_lq_init": use_lq_init,
+        "force_init_noise_std": init_noise_std,
         "n": len(names),
         "pred_dir": str(pred_dir),
         "save_pred_only": args.save_pred_only,

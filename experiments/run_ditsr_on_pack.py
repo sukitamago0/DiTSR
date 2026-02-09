@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--crop_border", type=int, default=4)
     ap.add_argument("--save_preds", action="store_true")
+    ap.add_argument("--vae_encode_mode", type=str, default="mean", choices=["mean", "sample"])
     args = ap.parse_args()
 
     M = importlib.import_module(args.train_module)
@@ -121,8 +122,12 @@ def main():
         lr = (lq01 * 2.0 - 1.0).clamp(-1.0, 1.0)
 
         with torch.autocast(device_type="cuda", dtype=M.COMPUTE_DTYPE):
-            z_hr = vae.encode(gt).latent_dist.sample(generator=gen) * vae.config.scaling_factor
-            z_lr = vae.encode(lr).latent_dist.sample(generator=gen) * vae.config.scaling_factor
+            if args.vae_encode_mode == "sample":
+                z_hr = vae.encode(gt).latent_dist.sample(generator=gen) * vae.config.scaling_factor
+                z_lr = vae.encode(lr).latent_dist.sample(generator=gen) * vae.config.scaling_factor
+            else:
+                z_hr = vae.encode(gt).latent_dist.mean * vae.config.scaling_factor
+                z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
         if getattr(M, "USE_LQ_INIT", False):
             latents = z_lr.clone()
@@ -205,6 +210,7 @@ def main():
         "cfg": args.cfg,
         "steps": args.steps,
         "seed": args.seed,
+        "vae_encode_mode": args.vae_encode_mode,
         "n": len(names),
         "psnr_y_mean": float(sum(psnr_y_all)/len(psnr_y_all)),
         "psnr_rgb_mean": float(sum(psnr_rgb_all)/len(psnr_rgb_all)),
