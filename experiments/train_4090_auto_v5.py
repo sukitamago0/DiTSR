@@ -119,6 +119,13 @@ LR_CONS_PROB = 1.0  # compute strict LR-consistency loss every step
 LR_CONS_WARMUP = 1000
 LR_CONS_RAMP = 5000
 LR_CONS_WEIGHT = 1.0
+# LR-consistency replay mode:
+# - "patch": low-memory patch-only replay (default, stable on 24GB)
+# - "full": full-image replay (may OOM on 24GB)
+# - "mixed": full replay every N steps, patch otherwise
+LR_CONS_MODE = "patch"  # "patch" | "full" | "mixed"
+LR_CONS_FULL_EVERY = 0  # only used when LR_CONS_MODE="mixed"
+VAE_TILING = False      # enable VAE tiling for full replay (reduces peak mem)
 DEG_OPS = ["blur", "resize", "noise", "jpeg"]
 P_TWO_STAGE = 0.35
 RESIZE_SCALE_RANGE = (0.3, 1.8)
@@ -1062,6 +1069,8 @@ def main():
     adapter = build_adapter("fpn_se", 4, 1152).to(DEVICE).float().train()
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
+    if VAE_TILING and hasattr(vae, "enable_tiling"):
+        vae.enable_tiling()
     lpips_fn = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     # Freeze VAE/LPIPS weights (keep gradients to inputs if decode is used for losses)
     for p in vae.parameters():
@@ -1208,25 +1217,47 @@ def main():
                     loss_noise_cons = torch.tensor(0.0, device=DEVICE)
 
                 # --- Strict LR consistency (optional) ---
-                # Use patch-level degradation replay to avoid full 512 decode OOM.
+                # Supports patch-level replay (default) and optional full replay.
                 if USE_LR_CONSISTENCY and w.get("cons", 0.0) > 0 and (torch.rand((), device=DEVICE) < LR_CONS_PROB):
                     deg = batch.get("deg", None)
                     if deg is None:
                         # Should not happen in training dataset; keep safe
                         loss_cons = torch.tensor(0.0, device=DEVICE)
                     else:
-                        lr_hat_list = []
-                        for b in range(img_p.shape[0]):
-                            meta_b = build_stage_meta_from_deg(deg, b)
-                            img_cpu = img_p[b].detach().float().cpu()  # patch-sized replay (256x256)
-                            lr_hat_b = patch_pipeline(img_cpu, return_meta=False, meta=meta_b)
-                            lr_hat_b = lr_hat_b.to(DEVICE)
-                            lr_hat_list.append(lr_hat_b)
-                        lr_hat = torch.stack(lr_hat_list, dim=0).to(DEVICE)
-                        # Compare patch-sized LR
-                        y0 = top * 8; x0 = left * 8
-                        lr_in_p  = lr[..., y0:y0+256, x0:x0+256]
-                        loss_cons = F.l1_loss(lr_hat, lr_in_p)
+                        use_full = False
+                        if LR_CONS_MODE == "full":
+                            use_full = True
+                        elif LR_CONS_MODE == "mixed" and LR_CONS_FULL_EVERY and (step % LR_CONS_FULL_EVERY == 0):
+                            use_full = True
+
+                        if use_full:
+                            # Full-image replay (may be heavy; enable VAE tiling if needed).
+                            img_full = vae.decode(z0 / vae.config.scaling_factor).sample.clamp(-1, 1)
+                            lr_hat_list = []
+                            for b in range(img_full.shape[0]):
+                                meta_b = build_stage_meta_from_deg(deg, b)
+                                img_cpu = img_full[b].detach().float().cpu()
+                                lr_hat_b = train_ds.pipeline(img_cpu, return_meta=False, meta=meta_b)
+                                lr_hat_b = lr_hat_b.to(DEVICE)
+                                lr_hat_list.append(lr_hat_b)
+                            lr_hat = torch.stack(lr_hat_list, dim=0).to(DEVICE)
+                            y0 = top * 8; x0 = left * 8
+                            lr_hat_p = lr_hat[..., y0:y0+256, x0:x0+256]
+                            lr_in_p  = lr[..., y0:y0+256, x0:x0+256]
+                            loss_cons = F.l1_loss(lr_hat_p, lr_in_p)
+                        else:
+                            lr_hat_list = []
+                            for b in range(img_p.shape[0]):
+                                meta_b = build_stage_meta_from_deg(deg, b)
+                                img_cpu = img_p[b].detach().float().cpu()  # patch-sized replay (256x256)
+                                lr_hat_b = patch_pipeline(img_cpu, return_meta=False, meta=meta_b)
+                                lr_hat_b = lr_hat_b.to(DEVICE)
+                                lr_hat_list.append(lr_hat_b)
+                            lr_hat = torch.stack(lr_hat_list, dim=0).to(DEVICE)
+                            # Compare patch-sized LR
+                            y0 = top * 8; x0 = left * 8
+                            lr_in_p  = lr[..., y0:y0+256, x0:x0+256]
+                            loss_cons = F.l1_loss(lr_hat, lr_in_p)
                 else:
                     loss_cons = torch.tensor(0.0, device=DEVICE)
 
