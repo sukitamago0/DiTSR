@@ -302,6 +302,7 @@ def main():
                         adapter_cond=None,
                         injection_mode="hybrid",
                         force_drop_ids=drop_uncond,
+                        lq_latent=z_lr,
                     )
                     out_cond = pixart(
                         x=latents.to(compute_dtype) if use_autocast else latents,
@@ -312,6 +313,7 @@ def main():
                         adapter_cond=cond,
                         injection_mode="hybrid",
                         force_drop_ids=drop_cond,
+                        lq_latent=z_lr,
                     )
 
                     if out_uncond.shape[1] == 8:

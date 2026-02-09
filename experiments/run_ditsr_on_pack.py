@@ -152,12 +152,14 @@ def main():
                 out_uncond = pixart(
                     x=latents.to(M.COMPUTE_DTYPE), timestep=t_b, y=y_embed,
                     mask=None, data_info=d_info, adapter_cond=None,
-                    injection_mode="hybrid", force_drop_ids=drop_uncond
+                    injection_mode="hybrid", force_drop_ids=drop_uncond,
+                    lq_latent=z_lr,
                 )
                 out_cond = pixart(
                     x=latents.to(M.COMPUTE_DTYPE), timestep=t_b, y=y_embed,
                     mask=None, data_info=d_info, adapter_cond=cond,
-                    injection_mode="hybrid", force_drop_ids=drop_cond
+                    injection_mode="hybrid", force_drop_ids=drop_cond,
+                    lq_latent=z_lr,
                 )
                 if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
                 if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)

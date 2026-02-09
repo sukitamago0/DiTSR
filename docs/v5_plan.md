@@ -8,6 +8,7 @@ v5 的设计目标是把模型从“生成型扩散”转为“强约束复原�
 - **文本条件**：关闭（force drop）。
 - **LR-consistency**：每步计算（强约束）。
 - **LQ-init**：训练与推理一致启用。
+- **强输入条件**：LR latent 通过主干输入残差注入（避免仅靠弱 adapter）。
 - **损失结构**：以 L1 + LR-consistency 为主，LPIPS 低权重、延迟引入。
 
 **进入超分门槛（建议）**  
@@ -21,4 +22,3 @@ valpack(lq512) 上 PSNR_Y ≥ identity − 0.2 dB，且 LPIPS ≤ identity。
 ## 实施说明
 - v5 训练脚本默认执行阶段 A（复原）。
 - 进入阶段 B 后，切换 valpack LR 目录为 lq128，并在训练数据侧引入 lq128 输入（或上采样至 512 后输入）。
-

@@ -975,12 +975,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     out_uncond = pixart(
                         x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
                         mask=None, data_info=data_info, adapter_cond=None,
-                        injection_mode="hybrid", force_drop_ids=drop_uncond
+                        injection_mode="hybrid", force_drop_ids=drop_uncond,
+                        lq_latent=z_lr,
                     )
                     out_cond = pixart(
                         x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
                         mask=None, data_info=data_info, adapter_cond=cond,
-                        injection_mode="hybrid", force_drop_ids=drop_cond
+                        injection_mode="hybrid", force_drop_ids=drop_cond,
+                        lq_latent=z_lr,
                     )
                     if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
                     if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
@@ -1133,17 +1135,19 @@ def main():
                         drop_cond = torch.zeros(zt.shape[0], device=DEVICE)
                     out_uncond = pixart(
                         x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=None,
-                        injection_mode="hybrid", force_drop_ids=drop_uncond
+                        injection_mode="hybrid", force_drop_ids=drop_uncond,
+                        lq_latent=zl,
                     )
                     out_cond = pixart(
                         x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond,
-                        injection_mode="hybrid", force_drop_ids=drop_cond
+                        injection_mode="hybrid", force_drop_ids=drop_cond,
+                        lq_latent=zl,
                     )
                     if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
                     if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
                     eps = out_uncond + CFG_TRAIN_SCALE * (out_cond - out_uncond)
                 else:
-                    kwargs = dict(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                    kwargs = dict(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid", lq_latent=zl)
                     if FORCE_DROP_TEXT:
                         kwargs["force_drop_ids"] = torch.ones((zt.shape[0],), device=DEVICE)
                     out = pixart(**kwargs)
@@ -1182,17 +1186,19 @@ def main():
                         if USE_CFG_TRAIN:
                             out2_uncond = pixart(
                                 x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=None,
-                                injection_mode="hybrid", force_drop_ids=drop_uncond
+                                injection_mode="hybrid", force_drop_ids=drop_uncond,
+                                lq_latent=zl,
                             )
                             out2_cond = pixart(
                                 x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond,
-                                injection_mode="hybrid", force_drop_ids=drop_cond
+                                injection_mode="hybrid", force_drop_ids=drop_cond,
+                                lq_latent=zl,
                             )
                             if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
                             if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
                             eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
                         else:
-                            kwargs2 = dict(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                            kwargs2 = dict(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid", lq_latent=zl)
                             if FORCE_DROP_TEXT:
                                 kwargs2["force_drop_ids"] = torch.ones((zt.shape[0],), device=DEVICE)
                             out2 = pixart(**kwargs2)

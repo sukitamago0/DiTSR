@@ -108,6 +108,11 @@ class PixArtMS(PixArt):
         ])
         self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
 
+        # Strong conditioning: project LR latent into input space and add to x.
+        self.latent_cond_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=True)
+        nn.init.zeros_(self.latent_cond_proj.weight)
+        nn.init.zeros_(self.latent_cond_proj.bias)
+
         # ==========================================================
         # Input Injection (Multi-Level Support)
         # ==========================================================
@@ -184,12 +189,16 @@ class PixArtMS(PixArt):
         adapter_cond=None,      
         injection_mode='hybrid',
         force_drop_ids=None,
+        lq_latent=None,
         **kwargs,
     ):
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         y = y.to(self.dtype)
+
+        if lq_latent is not None:
+            x = x + self.latent_cond_proj(lq_latent.to(x.dtype))
 
         c_size = data_info["img_hw"].to(self.dtype)
         ar = data_info["aspect_ratio"].to(self.dtype)
