@@ -665,22 +665,33 @@ class MultiLevelAdapterFPN(nn.Module):
             ResBlock(512),
             ResBlock(512),
         )
+        self.body4 = nn.Sequential(
+            nn.Conv2d(512, 512, 3, padding=1, stride=2),  # 8 -> 4
+            ResBlock(512),
+            ResBlock(512),
+        )
 
         self.lat0 = nn.Conv2d(64, base_channels, 1)
         self.lat1 = nn.Conv2d(128, base_channels, 1)
         self.lat2 = nn.Conv2d(256, base_channels, 1)
         self.lat3 = nn.Conv2d(512, base_channels, 1)
+        self.lat4 = nn.Conv2d(512, base_channels, 1)
 
         self.refine0 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
         self.refine1 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
         self.refine2 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
         self.refine3 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
+        self.refine4 = nn.Sequential(ResBlock(base_channels), ResBlock(base_channels))
 
-        self.scale_gates = nn.Parameter(torch.ones(4, dtype=torch.float32))
+        self.scale_gates = nn.Parameter(torch.ones(8, dtype=torch.float32))
         self.proj_0 = self._make_projection(base_channels, hidden_size, stride=2)
         self.proj_1 = self._make_projection(base_channels, hidden_size, stride=1)
         self.proj_2 = self._make_projection(base_channels, hidden_size, stride=1)
         self.proj_3 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_4 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_5 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_6 = self._make_projection(base_channels, hidden_size, stride=1)
+        self.proj_7 = self._make_projection(base_channels, hidden_size, stride=1)
 
     def _make_projection(self, in_ch, out_ch, stride):
         proj = nn.Sequential(
@@ -692,8 +703,9 @@ class MultiLevelAdapterFPN(nn.Module):
         nn.init.zeros_(proj[-1].bias)
         return proj
 
-    def _fpn(self, f0, f1, f2, f3):
-        p3 = self.lat3(f3)
+    def _fpn(self, f0, f1, f2, f3, f4):
+        p4 = self.lat4(f4)
+        p3 = self.lat3(f3) + F.interpolate(p4, size=f3.shape[-2:], mode="bilinear", align_corners=False)
         p2 = self.lat2(f2) + F.interpolate(p3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
         p1 = self.lat1(f1) + F.interpolate(p2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
         p0 = self.lat0(f0) + F.interpolate(p1, size=f0.shape[-2:], mode="bilinear", align_corners=False)
@@ -701,21 +713,31 @@ class MultiLevelAdapterFPN(nn.Module):
         p1 = self.refine1(p1)
         p2 = self.refine2(p2)
         p3 = self.refine3(p3)
-        return p0, p1, p2, p3
+        p4 = self.refine4(p4)
+        return p0, p1, p2, p3, p4
 
     def forward(self, x):
         f0 = self.stem(x)   # 64x64
         f1 = self.body1(f0) # 32x32
         f2 = self.body2(f1) # 16x16
         f3 = self.body3(f2) # 8x8
+        f4 = self.body4(f3) # 4x4
 
-        p0, p1, p2, p3 = self._fpn(f0, f1, f2, f3)
+        p0, p1, p2, p3, p4 = self._fpn(f0, f1, f2, f3, f4)
+
+        p2_up = F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)
+        p3_up = F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)
+        p4_up = F.interpolate(p4, size=(32, 32), mode="bilinear", align_corners=False)
 
         out0 = self.proj_0(p0) * self.scale_gates[0]
         out1 = self.proj_1(p1) * self.scale_gates[1]
-        out2 = self.proj_2(F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[2]
-        out3 = self.proj_3(F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)) * self.scale_gates[3]
-        return [out0, out1, out2, out3]
+        out2 = self.proj_2(p2_up) * self.scale_gates[2]
+        out3 = self.proj_3(p3_up) * self.scale_gates[3]
+        out4 = self.proj_4(p4_up) * self.scale_gates[4]
+        out5 = self.proj_5(p3_up) * self.scale_gates[5]
+        out6 = self.proj_6(p2_up) * self.scale_gates[6]
+        out7 = self.proj_7(p4_up) * self.scale_gates[7]
+        return [out0, out1, out2, out3, out4, out5, out6, out7]
 
 
 class MultiLevelAdapterSE(MultiLevelAdapterFPN):
@@ -725,14 +747,16 @@ class MultiLevelAdapterSE(MultiLevelAdapterFPN):
         self.se1 = SEBlock(base_channels)
         self.se2 = SEBlock(base_channels)
         self.se3 = SEBlock(base_channels)
+        self.se4 = SEBlock(base_channels)
 
-    def _fpn(self, f0, f1, f2, f3):
-        p0, p1, p2, p3 = super()._fpn(f0, f1, f2, f3)
+    def _fpn(self, f0, f1, f2, f3, f4):
+        p0, p1, p2, p3, p4 = super()._fpn(f0, f1, f2, f3, f4)
         p0 = self.se0(p0)
         p1 = self.se1(p1)
         p2 = self.se2(p2)
         p3 = self.se3(p3)
-        return p0, p1, p2, p3
+        p4 = self.se4(p4)
+        return p0, p1, p2, p3, p4
 
 
 class MultiLevelAdapterFPNHF(MultiLevelAdapterFPN):
@@ -759,6 +783,10 @@ class MultiLevelAdapterFPNHF(MultiLevelAdapterFPN):
         hf = self._laplacian(x)
         hf = self.hf_body(hf)
         hf = self.hf_proj(hf)
+        if len(features) >= 8:
+            features = list(features)
+            features[-1] = hf
+            return features
         return features + [hf]
 
 

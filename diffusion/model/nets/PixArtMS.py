@@ -234,7 +234,7 @@ class PixArtMS(PixArt):
                 feat_flat = adapter_cond.flatten(2).transpose(1, 2)
                 with torch.cuda.amp.autocast(enabled=False):
                     feat_flat = self.input_adapter_ln(feat_flat.float())
-                # 复制 4 份，填满 injection_layers
+                # 复制到与 injection_layers 数量一致
                 adapter_features = [feat_flat] * len(self.injection_layers)
 
         t = self.t_embedder(timestep)

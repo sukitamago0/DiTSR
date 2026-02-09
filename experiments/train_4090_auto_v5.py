@@ -88,9 +88,11 @@ LORA_ALPHA = 16
 # [Curriculum Logic]
 # Step 0-5000: L1=1.0, LPIPS=0.0 (Fix Color/Structure)
 # Step 5000-10000: LPIPS ramps up to 0.5
-WARMUP_STEPS = 0
-RAMP_UP_STEPS = 8000
-TARGET_LPIPS_WEIGHT = 0.10  # keep perceptual low for fidelity-first training
+WARMUP_STEPS = 5000
+RAMP_UP_STEPS = 5000
+TARGET_LPIPS_WEIGHT = 0.30  # LPIPS as primary perceptual objective after warmup
+L1_BASE_WEIGHT = 1.0
+L1_MIN_WEIGHT = 0.5
 
 # Validation
 VAL_STEPS_LIST = [50]   # training-time validation uses ONLY 50-step sampling (main metric / best ckpt)
@@ -105,7 +107,7 @@ CFG_SCALE = 3.0
 USE_LQ_INIT = True
 INIT_NOISE_STD = 0.05
 LQ_INIT_STRENGTH = 0.5  # 0~1, start from this noise level when using LQ-init
-USE_CFG_TRAIN = True
+USE_CFG_TRAIN = False
 CFG_TRAIN_SCALE = 3.0
 USE_ADAPTER_CFDROPOUT = True  # adapter-only classifier-free dropout (train-time)
 COND_DROP_PROB = 0.10         # probability to drop adapter condition per-sample
@@ -143,7 +145,7 @@ def get_loss_weights(global_step):
     # Anchor losses are always active (diffusion eps MSE + image L1).
     # LPIPS is introduced later and weaker to reduce early hallucination.
     # LR-consistency (strict replayed degradation) ramps up BEFORE LPIPS to anchor details.
-    weights = {'mse': 1.0, 'l1': 1.0}
+    weights = {'mse': 1.0, 'l1': L1_BASE_WEIGHT}
 
     # --- LR consistency schedule (optional) ---
     if USE_LR_CONSISTENCY:
@@ -157,13 +159,18 @@ def get_loss_weights(global_step):
     else:
         weights['cons'] = 0.0
 
-    # --- LPIPS schedule (linear warmup from step 0) ---
+    # --- LPIPS schedule (linear warmup after WARMUP_STEPS) ---
     if global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
-        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS if global_step > WARMUP_STEPS else 0.0
+        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS if global_step >= WARMUP_STEPS else 0.0
         progress = max(0.0, min(1.0, progress))
         weights['lpips'] = TARGET_LPIPS_WEIGHT * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
+
+    # --- L1 decay after LPIPS warmup begins (keep structure, reduce dominance) ---
+    if global_step >= WARMUP_STEPS:
+        decay_p = min(1.0, (global_step - WARMUP_STEPS) / max(RAMP_UP_STEPS, 1))
+        weights['l1'] = L1_BASE_WEIGHT - decay_p * (L1_BASE_WEIGHT - L1_MIN_WEIGHT)
 
     # --- Noise-level consistency schedule ---
     if global_step < NOISE_CONS_WARMUP:
@@ -335,6 +342,8 @@ def get_config_snapshot():
         "warmup_steps": WARMUP_STEPS,
         "ramp_up_steps": RAMP_UP_STEPS,
         "target_lpips_weight": TARGET_LPIPS_WEIGHT,
+        "l1_base_weight": L1_BASE_WEIGHT,
+        "l1_min_weight": L1_MIN_WEIGHT,
         "val_steps_list": VAL_STEPS_LIST,
         "best_val_steps": BEST_VAL_STEPS,
         "psnr_switch": PSNR_SWITCH,
