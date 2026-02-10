@@ -99,6 +99,7 @@ class PixArtMSV6(PixArt):
         config=None,
         model_max_length=120,
         sparse_inject_ratio: float = 1.0,
+        injection_cutoff_layer: int = -1,
         **kwargs,
     ):
         if window_block_indexes is None:
@@ -162,6 +163,11 @@ class PixArtMSV6(PixArt):
             self.injection_layers = all_layers[:num_keep]
         else:
             self.injection_layers = all_layers
+
+        if injection_cutoff_layer is None or int(injection_cutoff_layer) < 0:
+            self.injection_cutoff_layer = depth
+        else:
+            self.injection_cutoff_layer = min(depth, int(injection_cutoff_layer))
 
         self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(len(self.injection_layers))])
 
@@ -304,7 +310,7 @@ class PixArtMSV6(PixArt):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         for i, block in enumerate(self.blocks):
-            if flat_features and i in self.injection_layers:
+            if flat_features and i in self.injection_layers and i < self.injection_cutoff_layer:
                 scale_idx = self.injection_layers.index(i)
                 feat_idx = self._select_feature_index(i, len(flat_features))
                 feat = flat_features[feat_idx]

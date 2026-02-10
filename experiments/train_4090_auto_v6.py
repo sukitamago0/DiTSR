@@ -104,6 +104,7 @@ LR_BASE = 1e-5
 LORA_RANK = 16
 LORA_ALPHA = 16
 SPARSE_INJECT_RATIO = 1.0  # SR任务默认全层注入，避免深层空间条件缺失
+INJECTION_CUTOFF_LAYER = 21  # 仅在前段层注入空间条件，后段保留生成自由度
 
 # [Curriculum Logic]
 # Step 0-5000: L1=1.0, LPIPS=0.0 (Fix Color/Structure)
@@ -428,6 +429,7 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "lora_alpha": LORA_ALPHA,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
+        "injection_cutoff_layer": INJECTION_CUTOFF_LAYER,
         "warmup_steps": WARMUP_STEPS,
         "ramp_up_steps": RAMP_UP_STEPS,
         "target_lpips_weight": TARGET_LPIPS_WEIGHT,
@@ -1044,7 +1046,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     state = {
         "epoch": epoch,
         "step": global_step,
-        "adapter": adapter.state_dict(),
+        "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
         "optimizer": optimizer.state_dict(),
         "rng_state": {
             "torch": torch.get_rng_state(),
@@ -1299,7 +1301,11 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
     # Models
-    pixart = PixArtMSV6_XL_2(input_size=64, sparse_inject_ratio=SPARSE_INJECT_RATIO).to(DEVICE)
+    pixart = PixArtMSV6_XL_2(
+        input_size=64,
+        sparse_inject_ratio=SPARSE_INJECT_RATIO,
+        injection_cutoff_layer=INJECTION_CUTOFF_LAYER,
+    ).to(DEVICE)
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
