@@ -57,6 +57,16 @@ FP32_SAVE_KEY_FRAGMENTS = (
 )
 
 
+def get_required_v6_key_fragments_for_model(model: nn.Module):
+    """Only require fragments that actually have trainable parameters in current model."""
+    trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+    required = []
+    for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS:
+        if any(frag in name for name in trainable_names):
+            required.append(frag)
+    return tuple(required)
+
+
 # ================= 2. Hyper-parameters =================
 # Paths
 TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
@@ -392,12 +402,12 @@ def collect_trainable_state_dict(model: nn.Module):
     return state
 
 
-def validate_v6_trainable_state_keys(trainable_sd: dict):
+def validate_v6_trainable_state_keys(trainable_sd: dict, required_fragments):
     """Defensive validation to ensure v6 non-LoRA trainables are persisted."""
     keys = list(trainable_sd.keys())
     missing = []
     counts = {}
-    for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS:
+    for frag in required_fragments:
         c = sum(1 for k in keys if frag in k)
         counts[frag] = c
         if c == 0:
@@ -999,7 +1009,8 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
             BASE_PIXART_SHA256 = None
 
     pixart_sd = collect_trainable_state_dict(pixart)
-    v6_key_counts = validate_v6_trainable_state_keys(pixart_sd)
+    required_frags = get_required_v6_key_fragments_for_model(pixart)
+    v6_key_counts = validate_v6_trainable_state_keys(pixart_sd, required_frags)
     print("✅ v6 save check:", ", ".join([f"{k}={v}" for k, v in v6_key_counts.items()]))
     state = {
         "epoch": epoch,
@@ -1085,7 +1096,8 @@ def resume(pixart, adapter, optimizer, dl_gen):
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     saved_trainable = ckpt.get("pixart_trainable", {})
-    missing_required = [frag for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS if not any(frag in k for k in saved_trainable.keys())]
+    required_frags = get_required_v6_key_fragments_for_model(pixart)
+    missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required:
         raise RuntimeError(
             "Checkpoint is missing required v6 trainable keys: " + ", ".join(missing_required)
