@@ -100,6 +100,7 @@ class PixArtMSV6(PixArt):
         model_max_length=120,
         sparse_inject_ratio: float = 1.0,
         injection_cutoff_layer: int = -1,
+        injection_strategy: str = "front_dense",
         **kwargs,
     ):
         if window_block_indexes is None:
@@ -158,16 +159,23 @@ class PixArtMSV6(PixArt):
         self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
 
         all_layers = list(range(depth))
-        if sparse_inject_ratio < 1.0:
-            num_keep = max(1, int(len(all_layers) * sparse_inject_ratio))
-            self.injection_layers = all_layers[:num_keep]
-        else:
-            self.injection_layers = all_layers
-
         if injection_cutoff_layer is None or int(injection_cutoff_layer) < 0:
             self.injection_cutoff_layer = depth
         else:
             self.injection_cutoff_layer = min(depth, int(injection_cutoff_layer))
+
+        if injection_strategy == "front_dense":
+            dense_cutoff = max(1, int(depth * 0.5))
+            layers = list(range(dense_cutoff))
+            layers.extend(list(range(dense_cutoff, depth, 2)))
+            layers = sorted(set(l for l in layers if l < self.injection_cutoff_layer))
+            self.injection_layers = layers
+        else:
+            if sparse_inject_ratio < 1.0:
+                num_keep = max(1, int(len(all_layers) * sparse_inject_ratio))
+                self.injection_layers = [l for l in all_layers[:num_keep] if l < self.injection_cutoff_layer]
+            else:
+                self.injection_layers = [l for l in all_layers if l < self.injection_cutoff_layer]
 
         self.injection_scales = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(len(self.injection_layers))])
 
@@ -192,6 +200,9 @@ class PixArtMSV6(PixArt):
         self.input_res_proj = nn.ModuleList(
             [nn.Linear(hidden_size, hidden_size, bias=True) for _ in range(len(self.injection_layers))]
         )
+        self.layer_feat_proj = nn.ModuleList(
+            [nn.Linear(hidden_size, hidden_size, bias=True) for _ in range(len(self.injection_layers))]
+        )
 
         self.initialize()
         for lin in self.input_adaln:
@@ -199,6 +210,9 @@ class PixArtMSV6(PixArt):
             nn.init.zeros_(lin.bias)
         for lin in self.input_res_proj:
             nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+        for lin in self.layer_feat_proj:
+            nn.init.xavier_uniform_(lin.weight)
             nn.init.zeros_(lin.bias)
         nn.init.zeros_(self.adapter_alpha_mlp[-2].weight)
         nn.init.zeros_(self.adapter_alpha_mlp[-2].bias)
@@ -314,6 +328,7 @@ class PixArtMSV6(PixArt):
                 scale_idx = self.injection_layers.index(i)
                 feat_idx = self._select_feature_index(i, len(flat_features))
                 feat = flat_features[feat_idx]
+                feat = self.layer_feat_proj[scale_idx](feat)
 
                 alpha = self.injection_scales[scale_idx] * self.adapter_alpha_mlp(t)
                 alpha = alpha.view(-1, 1, 1)

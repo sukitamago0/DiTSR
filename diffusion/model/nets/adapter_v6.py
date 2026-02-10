@@ -102,13 +102,11 @@ class MultiLevelAdapterV6(nn.Module):
         f3 = self.body3(f2)
 
         p0, p1, p2, p3 = self._fpn(f0, f1, f2, f3)
-        p2_up = F.interpolate(p2, size=(32, 32), mode="bilinear", align_corners=False)
-        p3_up = F.interpolate(p3, size=(32, 32), mode="bilinear", align_corners=False)
 
         out0 = self.proj_0(p0)
         out1 = self.proj_1(p1)
-        out2 = self.proj_2(p2_up)
-        out3 = self.proj_3(p3_up)
+        out2 = self.proj_2(p2)
+        out3 = self.proj_3(p3)
         return [out0, out1, out2, out3], style_vec
 
 

@@ -105,6 +105,8 @@ LORA_RANK = 16
 LORA_ALPHA = 16
 SPARSE_INJECT_RATIO = 1.0  # SR任务默认全层注入，避免深层空间条件缺失
 INJECTION_CUTOFF_LAYER = 21  # 仅在前段层注入空间条件，后段保留生成自由度
+INJECTION_STRATEGY = "front_dense"
+LR_LATENT_NOISE_STD = 0.0  # 训练时给LR latent加微噪声以缓解过拟合条件
 
 # [Curriculum Logic]
 # Step 0-5000: L1=1.0, LPIPS=0.0 (Fix Color/Structure)
@@ -430,6 +432,8 @@ def get_config_snapshot():
         "lora_alpha": LORA_ALPHA,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "injection_cutoff_layer": INJECTION_CUTOFF_LAYER,
+        "injection_strategy": INJECTION_STRATEGY,
+        "lr_latent_noise_std": LR_LATENT_NOISE_STD,
         "warmup_steps": WARMUP_STEPS,
         "ramp_up_steps": RAMP_UP_STEPS,
         "target_lpips_weight": TARGET_LPIPS_WEIGHT,
@@ -1222,13 +1226,15 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else:
                         drop_uncond = torch.ones(latents.shape[0], device=DEVICE)
                         drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
+                    lr_ref = z_lr.to(COMPUTE_DTYPE)
+                    model_in = torch.cat([latents.to(COMPUTE_DTYPE), lr_ref], dim=1)
                     out_uncond = pixart(
-                        x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                        x=model_in, timestep=t_b, y=y_embed,
                         mask=None, data_info=data_info, adapter_cond=None,
                         injection_mode="hybrid", force_drop_ids=drop_uncond
                     )
                     out_cond = pixart(
-                        x=latents.to(COMPUTE_DTYPE), timestep=t_b, y=y_embed,
+                        x=model_in, timestep=t_b, y=y_embed,
                         mask=None, data_info=data_info, adapter_cond=cond,
                         injection_mode="hybrid", force_drop_ids=drop_cond
                     )
@@ -1303,12 +1309,19 @@ def main():
     # Models
     pixart = PixArtMSV6_XL_2(
         input_size=64,
+        in_channels=8,
         sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER,
+        injection_strategy=INJECTION_STRATEGY,
     ).to(DEVICE)
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
+    if "x_embedder.proj.weight" in base and base["x_embedder.proj.weight"].shape[1] == 4:
+        w4 = base["x_embedder.proj.weight"]
+        w8 = torch.zeros((w4.shape[0], 8, w4.shape[2], w4.shape[3]), dtype=w4.dtype)
+        w8[:, :4] = w4
+        base["x_embedder.proj.weight"] = w8
     pixart.load_state_dict(base, strict=False)
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
     pixart.train()
@@ -1371,6 +1384,9 @@ def main():
             t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
+            zlr_cond = zl.float()
+            if LR_LATENT_NOISE_STD > 0:
+                zlr_cond = zlr_cond + torch.randn_like(zlr_cond) * LR_LATENT_NOISE_STD
 
             cond = adapter(zl.float())
 
@@ -1390,18 +1406,18 @@ def main():
                         drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
                         drop_cond = torch.zeros(zt.shape[0], device=DEVICE)
                     out_uncond = pixart(
-                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=None,
+                        x=torch.cat([zt, zlr_cond.to(zt.dtype)], dim=1), timestep=t, y=y, data_info=d_info, adapter_cond=None,
                         injection_mode="hybrid", force_drop_ids=drop_uncond
                     )
                     out_cond = pixart(
-                        x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in,
+                        x=torch.cat([zt, zlr_cond.to(zt.dtype)], dim=1), timestep=t, y=y, data_info=d_info, adapter_cond=cond_in,
                         injection_mode="hybrid", force_drop_ids=drop_cond
                     )
                     if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
                     if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
                     eps = out_uncond + CFG_TRAIN_SCALE * (out_cond - out_uncond)
                 else:
-                    kwargs = dict(x=zt, timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                    kwargs = dict(x=torch.cat([zt, zlr_cond.to(zt.dtype)], dim=1), timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                     if FORCE_DROP_TEXT:
                         kwargs["force_drop_ids"] = torch.ones((zt.shape[0],), device=DEVICE)
                     out = pixart(**kwargs)
@@ -1436,21 +1452,22 @@ def main():
                 if USE_NOISE_CONSISTENCY and w.get("noise_cons", 0.0) > 0 and torch.rand((), device=DEVICE) < NOISE_CONS_PROB:
                     t2 = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
                     zt2 = diffusion.q_sample(zh, t2, noise)
+                    zlr_cond2 = zlr_cond
                     with torch.no_grad():
                         if USE_CFG_TRAIN:
                             out2_uncond = pixart(
-                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=None,
+                                x=torch.cat([zt2, zlr_cond2.to(zt2.dtype)], dim=1), timestep=t2, y=y, data_info=d_info, adapter_cond=None,
                                 injection_mode="hybrid", force_drop_ids=drop_uncond
                             )
                             out2_cond = pixart(
-                                x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in,
+                                x=torch.cat([zt2, zlr_cond2.to(zt2.dtype)], dim=1), timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in,
                                 injection_mode="hybrid", force_drop_ids=drop_cond
                             )
                             if out2_uncond.shape[1] == 8: out2_uncond, _ = out2_uncond.chunk(2, dim=1)
                             if out2_cond.shape[1] == 8: out2_cond, _ = out2_cond.chunk(2, dim=1)
                             eps2 = out2_uncond + CFG_TRAIN_SCALE * (out2_cond - out2_uncond)
                         else:
-                            kwargs2 = dict(x=zt2, timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                            kwargs2 = dict(x=torch.cat([zt2, zlr_cond2.to(zt2.dtype)], dim=1), timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                             if FORCE_DROP_TEXT:
                                 kwargs2["force_drop_ids"] = torch.ones((zt.shape[0],), device=DEVICE)
                             out2 = pixart(**kwargs2)
