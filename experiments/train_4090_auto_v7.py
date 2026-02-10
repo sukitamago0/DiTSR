@@ -1,5 +1,5 @@
-# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v6.py
-# DiTSR v6 Training Script
+# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v7.py
+# DiTSR v7 Training Script
 # Goal: strong restoration-first training with fixed valpack validation.
 # Strategy: no text conditioning, strong LR-consistency, LQ-init enabled.
 
@@ -41,8 +41,8 @@ from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
 
-# v6 critical module key fragments that must be present in saved trainable weights.
-V6_REQUIRED_PIXART_KEY_FRAGMENTS = (
+# v7 critical module key fragments that must be present in saved trainable weights.
+V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
     "input_adaln",
     "adapter_alpha_mlp",
     "input_res_proj",
@@ -58,11 +58,11 @@ FP32_SAVE_KEY_FRAGMENTS = (
 )
 
 
-def get_required_v6_key_fragments_for_model(model: nn.Module):
+def get_required_v7_key_fragments_for_model(model: nn.Module):
     """Only require fragments that actually have trainable parameters in current model."""
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     required = []
-    for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS:
+    for frag in V7_REQUIRED_PIXART_KEY_FRAGMENTS:
         if any(frag in name for name in trainable_names):
             required.append(frag)
     return tuple(required)
@@ -328,7 +328,7 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     Supports:
       - Tensor
       - List[Tensor]
-      - Tuple/List of (List[Tensor], Tensor) for v6 adapter outputs.
+      - Tuple/List of (List[Tensor], Tensor) for v7 adapter outputs.
     keep_mask: [B] float/bool where 1=keep, 0=drop.
     """
     if cond is None:
@@ -362,7 +362,7 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
         return _mask(cond)
 
     if isinstance(cond, (list, tuple)):
-        # v6 signature: (spatial_list, style_vec)
+        # v7 signature: (spatial_list, style_vec)
         if len(cond) == 2 and isinstance(cond[0], list) and torch.is_tensor(cond[1]):
             spatial = [_mask(c) for c in cond[0]]
             style = _mask(cond[1])
@@ -394,7 +394,7 @@ def _should_keep_fp32_on_save(param_name: str) -> bool:
 
 
 def collect_trainable_state_dict(model: nn.Module):
-    """Collect all trainable parameters from model with v6-sensitive fp32 casting on save."""
+    """Collect all trainable parameters from model with v7-sensitive fp32 casting on save."""
     state = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -406,8 +406,8 @@ def collect_trainable_state_dict(model: nn.Module):
     return state
 
 
-def validate_v6_trainable_state_keys(trainable_sd: dict, required_fragments):
-    """Defensive validation to ensure v6 non-LoRA trainables are persisted."""
+def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
+    """Defensive validation to ensure v7 non-LoRA trainables are persisted."""
     keys = list(trainable_sd.keys())
     missing = []
     counts = {}
@@ -418,7 +418,7 @@ def validate_v6_trainable_state_keys(trainable_sd: dict, required_fragments):
             missing.append(frag)
     if missing:
         raise RuntimeError(
-            "v6 trainable checkpoint validation failed; missing required key fragments: "
+            "v7 trainable checkpoint validation failed; missing required key fragments: "
             + ", ".join(missing)
         )
     return counts
@@ -1044,9 +1044,9 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
             BASE_PIXART_SHA256 = None
 
     pixart_sd = collect_trainable_state_dict(pixart)
-    required_frags = get_required_v6_key_fragments_for_model(pixart)
-    v6_key_counts = validate_v6_trainable_state_keys(pixart_sd, required_frags)
-    print("✅ v6 save check:", ", ".join([f"{k}={v}" for k, v in v6_key_counts.items()]))
+    required_frags = get_required_v7_key_fragments_for_model(pixart)
+    v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
+    print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
     state = {
         "epoch": epoch,
         "step": global_step,
@@ -1135,11 +1135,11 @@ def resume(pixart, adapter, optimizer, dl_gen):
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     saved_trainable = ckpt.get("pixart_trainable", {})
-    required_frags = get_required_v6_key_fragments_for_model(pixart)
+    required_frags = get_required_v7_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required:
         raise RuntimeError(
-            "Checkpoint is missing required v6 trainable keys: " + ", ".join(missing_required)
+            "Checkpoint is missing required v7 trainable keys: " + ", ".join(missing_required)
         )
     adapter_sd = ckpt.get("adapter", {})
     missing, unexpected = adapter.load_state_dict(adapter_sd, strict=False)
