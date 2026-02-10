@@ -103,7 +103,7 @@ NUM_WORKERS = 8
 LR_BASE = 1e-5
 LORA_RANK = 16
 LORA_ALPHA = 16
-SPARSE_INJECT_RATIO = 0.5
+SPARSE_INJECT_RATIO = 1.0  # SR任务默认全层注入，避免深层空间条件缺失
 
 # [Curriculum Logic]
 # Step 0-5000: L1=1.0, LPIPS=0.0 (Fix Color/Structure)

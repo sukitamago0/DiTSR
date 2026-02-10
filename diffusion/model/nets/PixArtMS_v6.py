@@ -125,6 +125,7 @@ class PixArtMSV6(PixArt):
         )
 
         self.h = self.w = 0
+        self.depth = depth
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.x_embedder = PatchEmbed(patch_size, in_channels, hidden_size, bias=True)
@@ -195,6 +196,29 @@ class PixArtMSV6(PixArt):
             nn.init.zeros_(lin.bias)
         nn.init.zeros_(self.adapter_alpha_mlp[-2].weight)
         nn.init.zeros_(self.adapter_alpha_mlp[-2].bias)
+
+    def _select_feature_index(self, layer_idx: int, num_features: int) -> int:
+        """Depth-aware inverted-pyramid mapping (avoid modulo cycling mismatches)."""
+        if num_features <= 1:
+            return 0
+        # Fallback for uncommon feature counts.
+        if num_features < 4:
+            split = max(1, self.depth // num_features)
+            return min(layer_idx // split, num_features - 1)
+
+        # Canonical v6 mapping for 4 spatial feature levels:
+        # shallow -> high-res features, deep -> low-res semantic features.
+        q1 = max(1, self.depth // 4)
+        q2 = max(q1 + 1, self.depth // 2)
+        q3 = max(q2 + 1, (3 * self.depth) // 4)
+        if layer_idx < q1:
+            return 0
+        if layer_idx < q2:
+            return 1
+        if layer_idx < q3:
+            return 2
+        return 3
+
 
     def forward(
         self,
@@ -282,7 +306,7 @@ class PixArtMSV6(PixArt):
         for i, block in enumerate(self.blocks):
             if flat_features and i in self.injection_layers:
                 scale_idx = self.injection_layers.index(i)
-                feat_idx = scale_idx % len(flat_features)
+                feat_idx = self._select_feature_index(i, len(flat_features))
                 feat = flat_features[feat_idx]
 
                 alpha = self.injection_scales[scale_idx] * self.adapter_alpha_mlp(t)
