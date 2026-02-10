@@ -40,6 +40,22 @@ from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
 
+# v6 critical module key fragments that must be present in saved trainable weights.
+V6_REQUIRED_PIXART_KEY_FRAGMENTS = (
+    "input_adaln",
+    "adapter_alpha_mlp",
+    "input_res_proj",
+    "injection_scales",
+    "input_adapter_ln",
+    "style_fusion_mlp",
+)
+FP32_SAVE_KEY_FRAGMENTS = (
+    "input_adaln",
+    "adapter_alpha_mlp",
+    "input_res_proj",
+    "style_fusion_mlp",
+)
+
 
 # ================= 2. Hyper-parameters =================
 # Paths
@@ -329,6 +345,41 @@ def file_sha256(path):
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
             sha.update(chunk)
     return sha.hexdigest()
+
+
+def _should_keep_fp32_on_save(param_name: str) -> bool:
+    return any(tag in param_name for tag in FP32_SAVE_KEY_FRAGMENTS)
+
+
+def collect_trainable_state_dict(model: nn.Module):
+    """Collect all trainable parameters from model with v6-sensitive fp32 casting on save."""
+    state = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        tensor = param.detach().cpu()
+        if _should_keep_fp32_on_save(name):
+            tensor = tensor.float()
+        state[name] = tensor
+    return state
+
+
+def validate_v6_trainable_state_keys(trainable_sd: dict):
+    """Defensive validation to ensure v6 non-LoRA trainables are persisted."""
+    keys = list(trainable_sd.keys())
+    missing = []
+    counts = {}
+    for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS:
+        c = sum(1 for k in keys if frag in k)
+        counts[frag] = c
+        if c == 0:
+            missing.append(frag)
+    if missing:
+        raise RuntimeError(
+            "v6 trainable checkpoint validation failed; missing required key fragments: "
+            + ", ".join(missing)
+        )
+    return counts
 
 def get_config_snapshot():
     return {
@@ -919,9 +970,9 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
             print(f"⚠️ Base PixArt hash failed (non-fatal): {e}")
             BASE_PIXART_SHA256 = None
 
-    trainable_names = {n for n, p in pixart.named_parameters() if p.requires_grad}
-    full_sd = pixart.state_dict()
-    pixart_sd = {k: v.detach().cpu() for k, v in full_sd.items() if k in trainable_names}
+    pixart_sd = collect_trainable_state_dict(pixart)
+    v6_key_counts = validate_v6_trainable_state_keys(pixart_sd)
+    print("✅ v6 save check:", ", ".join([f"{k}={v}" for k, v in v6_key_counts.items()]))
     state = {
         "epoch": epoch,
         "step": global_step,
@@ -1005,6 +1056,12 @@ def resume(pixart, adapter, optimizer, dl_gen):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
+    saved_trainable = ckpt.get("pixart_trainable", {})
+    missing_required = [frag for frag in V6_REQUIRED_PIXART_KEY_FRAGMENTS if not any(frag in k for k in saved_trainable.keys())]
+    if missing_required:
+        raise RuntimeError(
+            "Checkpoint is missing required v6 trainable keys: " + ", ".join(missing_required)
+        )
     adapter_sd = ckpt.get("adapter", {})
     missing, unexpected = adapter.load_state_dict(adapter_sd, strict=False)
     if missing or unexpected:
@@ -1018,7 +1075,7 @@ def resume(pixart, adapter, optimizer, dl_gen):
             with torch.no_grad():
                 current[:n].copy_(saved[:n])
     curr = pixart.state_dict()
-    for k, v in ckpt["pixart_trainable"].items():
+    for k, v in saved_trainable.items():
         if k in curr: curr[k] = v.to(curr[k].dtype)
     pixart.load_state_dict(curr, strict=False)
     optimizer.load_state_dict(ckpt["optimizer"])
