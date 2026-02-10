@@ -311,15 +311,32 @@ def differentiable_degrade_patch(img, meta, pipeline):
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     """Mask adapter condition per-sample.
-    cond can be a Tensor or a (list/tuple) of Tensors (multi-scale).
+    Supports:
+      - Tensor
+      - List[Tensor]
+      - Tuple/List of (List[Tensor], Tensor) for v6 adapter outputs.
     keep_mask: [B] float/bool where 1=keep, 0=drop.
     """
     if cond is None:
         return None
     if not torch.is_tensor(keep_mask):
         keep_mask = torch.tensor(keep_mask)
-    # ensure float mask on the same device
-    keep_mask = keep_mask.to(device=(cond.device if torch.is_tensor(cond) else cond[0].device), dtype=torch.float32)
+
+    def _find_device_dtype(x):
+        if torch.is_tensor(x):
+            return x.device, x.dtype
+        if isinstance(x, (list, tuple)):
+            for item in x:
+                found = _find_device_dtype(item)
+                if found is not None:
+                    return found
+        return None
+
+    found = _find_device_dtype(cond)
+    if found is None:
+        return cond
+    dev, _ = found
+    keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
 
     def _mask(x: torch.Tensor):
         m = keep_mask
@@ -329,13 +346,24 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
 
     if torch.is_tensor(cond):
         return _mask(cond)
+
     if isinstance(cond, (list, tuple)):
+        # v6 signature: (spatial_list, style_vec)
         if len(cond) == 2 and isinstance(cond[0], list) and torch.is_tensor(cond[1]):
             spatial = [_mask(c) for c in cond[0]]
             style = _mask(cond[1])
             return (spatial, style)
-        masked = [_mask(c) for c in cond]
+
+        masked = []
+        for c in cond:
+            if torch.is_tensor(c):
+                masked.append(_mask(c))
+            elif isinstance(c, list):
+                masked.append([_mask(ci) if torch.is_tensor(ci) else ci for ci in c])
+            else:
+                masked.append(c)
         return masked if isinstance(cond, list) else tuple(masked)
+
     # fallback (unexpected type)
     return cond
 
