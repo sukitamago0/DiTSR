@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import io
 import hashlib
+import shutil
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -943,6 +944,34 @@ def should_keep_ckpt(psnr_v, lpips_v):
     if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
     return (1, -psnr_v)
 
+
+def atomic_torch_save(state, path):
+    """Atomic checkpoint save with fallback serialization to avoid zip writer failures on large files."""
+    tmp = path + ".tmp"
+    # Try modern zip serialization first.
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+        return True, "zip"
+    except Exception as e_zip:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        # Fallback: legacy serialization is often more robust for very large checkpoints.
+        try:
+            torch.save(state, tmp, _use_new_zipfile_serialization=False)
+            os.replace(tmp, path)
+            return True, f"legacy ({e_zip})"
+        except Exception as e_old:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            return False, f"zip_error={e_zip}; legacy_error={e_old}"
+
 def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen):
     global BASE_PIXART_SHA256
 
@@ -1037,20 +1066,24 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, met
     # 3. 始终保存 last.pth (这是为了断点续训，必须有)
     # 使用临时文件名再重命名，防止写入一半被中断导致文件损坏
     last_path = LAST_CKPT_PATH
-    temp_path = LAST_CKPT_PATH + ".tmp"
-    try:
-        torch.save(state, temp_path)
-        os.replace(temp_path, last_path)
-        print(f"💾 Saved last checkpoint to {last_path}")
-    except Exception as e:
-        print(f"❌ Failed to save last.pth: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    ok_last, msg_last = atomic_torch_save(state, last_path)
+    if ok_last:
+        print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
+    else:
+        print(f"❌ Failed to save last.pth: {msg_last}")
 
     if save_as_best and current_record["path"]:
         try:
-            torch.save(state, current_record["path"])
-            print(f"🏆 New Best Model! Saved to {ckpt_name}")
+            # Reuse serialized last checkpoint to avoid writing another >2GB stream in the same step.
+            if ok_last and os.path.exists(last_path):
+                shutil.copy2(last_path, current_record["path"])
+                print(f"🏆 New Best Model! Copied from last.pth to {ckpt_name}")
+            else:
+                ok_best, msg_best = atomic_torch_save(state, current_record["path"])
+                if ok_best:
+                    print(f"🏆 New Best Model! Saved to {ckpt_name} [{msg_best}]")
+                else:
+                    print(f"❌ Failed to save best checkpoint: {msg_best}")
         except Exception as e:
             print(f"❌ Failed to save best checkpoint: {e}")
 
