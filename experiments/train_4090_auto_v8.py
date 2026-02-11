@@ -1,10 +1,12 @@
-# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v7.py
-# DiTSR v7 Training Script (Fixed Attribute Error)
+# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
+# DiTSR v8 Training Script
 # ------------------------------------------------------------------
-# Change Log vs Previous Version:
-# 1. FIXED CRITICAL BUG: Separated 'optim_groups' (for AdamW) from 'params_to_clip' (for clip_grad_norm_).
-#    This resolves the AttributeError: 'dict' object has no attribute 'grad'.
-# 2. Retained all scientific optimizations (Differential LR, Latent L1, Delayed LPIPS, Noise Aug).
+# Major Refactoring based on "DiT-SR v8 Report":
+# 1. Prediction Type: Switched to "v_prediction" (Velocity) for high-SNR stability.
+# 2. Conditioning: SR3-style augmentation (Augment LR + Pass noise level embedding).
+# 3. Consistency: Same noisy LR condition passed to both Adapter and Concat branch.
+# 4. Initialization: Using Copy-Init in Model V8 to ensure signal visibility at Step 0.
+# 5. Validation: Default to LQ-Init (img2img style) to anchor early predictions.
 # ------------------------------------------------------------------
 
 import os
@@ -38,32 +40,22 @@ from diffusers import AutoencoderKL, DDIMScheduler
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
-from diffusion.model.nets.PixArtMS_v7 import PixArtMSV7_XL_2
+# [Import V8 Model]
+from diffusion.model.nets.PixArtMS_v8 import PixArtMSV8_XL_2
 from diffusion.model.nets.adapter_v7 import build_adapter_v7
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
 
-# v7 critical module key fragments that must be present in saved trainable weights.
+# Added "aug_embedder" to required keys
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "input_adaln",
-    "adapter_alpha_mlp",
-    "input_res_proj",
-    "injection_scales",
-    "input_adapter_ln",
-    "style_fusion_mlp",
+    "input_adaln", "adapter_alpha_mlp", "input_res_proj", "injection_scales", 
+    "input_adapter_ln", "style_fusion_mlp", "aug_embedder"
 )
-FP32_SAVE_KEY_FRAGMENTS = (
-    "input_adaln",
-    "adapter_alpha_mlp",
-    "input_res_proj",
-    "style_fusion_mlp",
-)
-
+FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
-    """Only require fragments that actually have trainable parameters in current model."""
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     required = []
     for frag in V7_REQUIRED_PIXART_KEY_FRAGMENTS:
@@ -71,9 +63,7 @@ def get_required_v7_key_fragments_for_model(model: nn.Module):
             required.append(frag)
     return tuple(required)
 
-
 # ================= 2. Hyper-parameters =================
-# Paths
 TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
 VAL_HR_DIR   = "/data/DF2K/DF2K_valid_HR"
 VAL_LR_DIR   = "/data/DF2K/DF2K_valid_LR_bicubic/X4"
@@ -81,11 +71,9 @@ if not os.path.exists(VAL_LR_DIR): VAL_LR_DIR = None
 
 PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-XL-2-512x512.pth")
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
-
-# [Scientific Choice] Use Null Embeddings.
 T5_EMBED_PATH = "/home/hello/HJT/DiTSR/output/null_embed.pth"
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v7")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v8")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -102,12 +90,10 @@ FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
 FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
 FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
 
-# Optimization Dynamics
 BATCH_SIZE = 1
-GRAD_ACCUM_STEPS = 16 # Effective Batch = 16
+GRAD_ACCUM_STEPS = 16 
 NUM_WORKERS = 8
 
-# [Critical Change] Base LR is reference only. We use Differential LRs in optimizer.
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
@@ -115,17 +101,16 @@ SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 25
 INJECTION_STRATEGY = "front_dense"
 
-# [Scientific Choice] Input Noise Augmentation
-LR_LATENT_NOISE_STD = 0.05 
+# [V8 Augmentation] Range of noise added to LR condition (SR3 style)
+# This is physically added to the LR Latent.
+COND_AUG_NOISE_RANGE = (0.0, 0.15) 
 
-# [Curriculum Logic]
 WARMUP_STEPS = 3500          
 RAMP_UP_STEPS = 5000         
 TARGET_LPIPS_WEIGHT = 0.50
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
 
-# Validation
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
 PSNR_SWITCH = 24.0
@@ -135,24 +120,20 @@ VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed34
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
 CFG_SCALE = 3.0
-USE_LQ_INIT = False
+
+# [V8 Change] Default to LQ-Init for validation to see anchor immediately
+USE_LQ_INIT = True 
+LQ_INIT_STRENGTH = 0.9 # Start very close to LR
+
 INIT_NOISE_STD = 0.0
-LQ_INIT_STRENGTH = 0.0
 USE_CFG_TRAIN = False
 CFG_TRAIN_SCALE = 3.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True
 
-# [Scientific Choice] Removed Degradation Consistency
 USE_LR_CONSISTENCY = False 
-
-# Keep Noise Consistency 
-USE_NOISE_CONSISTENCY = True
-NOISE_CONS_WARMUP = 2000
-NOISE_CONS_RAMP = 6000
-NOISE_CONS_WEIGHT = 0.1
-NOISE_CONS_PROB = 0.5
+USE_NOISE_CONSISTENCY = False # V-pred makes this tricky, disabled for V8 stability
 
 VAE_TILING = False
 DEG_OPS = ["blur", "resize", "noise", "jpeg"]
@@ -161,18 +142,11 @@ RESIZE_SCALE_RANGE = (0.3, 1.8)
 NOISE_RANGE = (0.0, 0.05)
 BLUR_KERNELS = [7, 9, 11, 13, 15, 21]
 JPEG_QUALITY_RANGE = (30, 95)
-RESIZE_INTERP_MODES = [
-    transforms.InterpolationMode.NEAREST,
-    transforms.InterpolationMode.BILINEAR,
-    transforms.InterpolationMode.BICUBIC,
-]
+RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.InterpolationMode.BILINEAR, transforms.InterpolationMode.BICUBIC]
 
 # ================= 3. Logic Functions =================
 def get_loss_weights(global_step):
-    # Base: MSE + Latent L1
     weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
-
-    # --- LPIPS schedule (Perceptual) ---
     if global_step < WARMUP_STEPS:
         weights['lpips'] = 0.0
     elif global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
@@ -180,47 +154,23 @@ def get_loss_weights(global_step):
         weights['lpips'] = LPIPS_BASE_WEIGHT + (TARGET_LPIPS_WEIGHT - LPIPS_BASE_WEIGHT) * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
-
-    # --- Noise-level consistency schedule ---
-    if global_step < NOISE_CONS_WARMUP:
-        weights['noise_cons'] = 0.0
-    elif global_step < (NOISE_CONS_WARMUP + NOISE_CONS_RAMP):
-        progress = (global_step - NOISE_CONS_WARMUP) / NOISE_CONS_RAMP
-        weights['noise_cons'] = NOISE_CONS_WEIGHT * progress
-    else:
-        weights['noise_cons'] = NOISE_CONS_WEIGHT
     return weights
 
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481*r + 128.553*g + 24.966*b) / 255.0
 
-def shave_border(x, shave=4):
-    return x[..., shave:-shave, shave:-shave]
-
 def seed_everything(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if DETERMINISTIC:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    if DETERMINISTIC: torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
 def seed_worker(worker_id):
     worker_seed = SEED + worker_id
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
+    random.seed(worker_seed); np.random.seed(worker_seed); torch.manual_seed(worker_seed)
 
 def randn_like_with_generator(tensor, generator):
-    return torch.randn(
-        tensor.shape,
-        device=tensor.device,
-        dtype=tensor.dtype,
-        generator=generator,
-    )
+    return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
 
 def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     strength = float(max(0.0, min(1.0, strength)))
@@ -230,10 +180,11 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     start_index = min(max(start_index, 0), len(timesteps) - 1)
     t_start = timesteps[start_index]
     noise = randn_like_with_generator(z_lr, generator)
+    # V-Prediction / Img2Img Logic
     if hasattr(scheduler, "add_noise"):
         latents = scheduler.add_noise(z_lr, noise, t_start)
     else:
-        latents = z_lr + noise
+        latents = z_lr + noise # Fallback
     return latents.to(dtype=dtype), timesteps[start_index:]
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
@@ -271,8 +222,7 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            sha.update(chunk)
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""): sha.update(chunk)
     return sha.hexdigest()
 
 def _should_keep_fp32_on_save(param_name: str) -> bool:
@@ -295,20 +245,11 @@ def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
         c = sum(1 for k in keys if frag in k)
         counts[frag] = c
         if c == 0: missing.append(frag)
-    if missing:
-        raise RuntimeError("v7 trainable checkpoint validation failed: " + ", ".join(missing))
+    if missing: raise RuntimeError("Trainable checkpoint validation failed: " + ", ".join(missing))
     return counts
 
 def get_config_snapshot():
-    return {
-        "batch_size": BATCH_SIZE,
-        "lr_base": LR_BASE,
-        "lora_rank": LORA_RANK,
-        "sparse_inject_ratio": SPARSE_INJECT_RATIO,
-        "lr_latent_noise_std": LR_LATENT_NOISE_STD,
-        "loss_weights": "Dynamic",
-        "seed": SEED,
-    }
+    return {"batch_size": BATCH_SIZE, "lr_base": LR_BASE, "lora_rank": LORA_RANK, "v8_config": True}
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -446,24 +387,6 @@ class DegradationPipeline:
 
         def apply_ops(img_in, ops, params):
             out = img_in
-            def _match_chw(t, ref):
-                if t is None: return torch.zeros_like(ref)
-                if t.shape == ref.shape: return t
-                if t.shape[0] != ref.shape[0]:
-                    c = min(int(t.shape[0]), int(ref.shape[0]))
-                    t = t[:c]
-                    if c < ref.shape[0]:
-                        pad_c = int(ref.shape[0] - c)
-                        t = torch.cat([t, torch.zeros((pad_c, t.shape[1], t.shape[2]), device=t.device, dtype=t.dtype)], dim=0)
-                H, W = int(ref.shape[1]), int(ref.shape[2])
-                h, w = int(t.shape[1]), int(t.shape[2])
-                if h > H: t = t[:, (h - H) // 2 : (h - H) // 2 + H, :]
-                elif h < H: t = F.pad(t, (0, 0, (H - h) // 2, (H - h) - (H - h) // 2))
-                h, w = int(t.shape[1]), int(t.shape[2])
-                if w > W: t = t[:, :, (w - W) // 2 : (w - W) // 2 + W]
-                elif w < W: t = F.pad(t, ((W - w) // 2, (W - w) - (W - w) // 2, 0, 0))
-                return t
-
             stage_noise = None
             for op in ops:
                 if op == "blur" and params["blur_applied"]:
@@ -482,7 +405,7 @@ class DegradationPipeline:
                         else:
                             noise = params.get("noise")
                             if noise is None: noise = torch.zeros_like(out)
-                            else: noise = noise.to(out.device, dtype=out.dtype); noise = _match_chw(noise, out)
+                            else: noise = noise.to(out.device, dtype=out.dtype)
                         stage_noise = noise
                         out = (out + noise * params["noise_std"]).clamp(0.0, 1.0)
                     else: stage_noise = torch.zeros_like(out)
@@ -500,7 +423,7 @@ class DegradationPipeline:
         lr_out = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-        # FIXED: Strictly return 2 values (lr, meta)
+        # FIXED: Strictly return 2 values
         if return_meta:
             meta_out = {
                 "stage1_blur_applied": torch.tensor(int(stage1["blur_applied"]), dtype=torch.int64),
@@ -514,7 +437,6 @@ class DegradationPipeline:
                 "stage1_resize_scale": torch.tensor(float(stage1["resize_scale"]), dtype=torch.float32),
                 "stage1_resize_interp": torch.tensor(int(stage1["resize_interp_idx"]), dtype=torch.int64),
                 "stage1_jpeg_quality": torch.tensor(int(stage1["jpeg_quality"]), dtype=torch.int64),
-                
                 "stage2_blur_applied": torch.tensor(int(stage2["blur_applied"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_k_size": torch.tensor(int(stage2["k_size"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_sigma": torch.tensor(float(stage2["sigma"]), dtype=torch.float32) if stage2 else torch.tensor(0.0, dtype=torch.float32),
@@ -526,7 +448,6 @@ class DegradationPipeline:
                 "stage2_resize_scale": torch.tensor(float(stage2["resize_scale"]), dtype=torch.float32) if stage2 else torch.tensor(0.0, dtype=torch.float32),
                 "stage2_resize_interp": torch.tensor(int(stage2["resize_interp_idx"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_jpeg_quality": torch.tensor(int(stage2["jpeg_quality"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
-                
                 "use_two_stage": torch.tensor(int(use_two_stage), dtype=torch.int64),
                 "ops_stage1": ",".join(ops_stage1),
                 "ops_stage2": ",".join(ops_stage2),
@@ -536,6 +457,7 @@ class DegradationPipeline:
             return lr_out, meta_out
         return lr_out
 
+# ================= 5. Datasets =================
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, is_train=True):
         self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
@@ -635,7 +557,7 @@ class ValPackDataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
         return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
 
-# ================= 5. LoRA =================
+# ================= 6. LoRA =================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int, alpha: float):
         super().__init__()
@@ -659,7 +581,7 @@ def apply_lora(model, rank=64, alpha=64):
              setattr(parent, child, LoRALinear(module, rank, alpha)); cnt += 1
     print(f"✅ LoRA applied to {cnt} layers.")
 
-# ================= 6. Checkpointing =================
+# ================= 7. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     if not math.isfinite(psnr_v): return (999, float("inf"))
     if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
@@ -764,28 +686,38 @@ def resume(pixart, adapter, optimizer, dl_gen):
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
-# ================= 7. Validation =================
+# ================= 8. Validation =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
     print(f"🔎 Validating Epoch {epoch+1}...")
     pixart.eval(); adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
+    
+    # [V8 Change] Validation uses V-Prediction scheduler
+    scheduler = DDIMScheduler(
+        num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
+        clip_sample=False, prediction_type="v_prediction", set_alpha_to_one=False,
+    )
+    
     steps_list = [FAST_VAL_STEPS] if FAST_DEV_RUN else VAL_STEPS_LIST
     for steps in steps_list:
-        scheduler = DDIMScheduler(
-            num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
-            clip_sample=False, prediction_type="epsilon", set_alpha_to_one=False,
-        )
         scheduler.set_timesteps(steps, device=DEVICE)
         psnrs, ssims, lpipss = [], [], []; vis_done = False
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+            
+            # [V8 Change] Default USE_LQ_INIT=True helps anchoring early training
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
+            
             cond = adapter(z_lr.float())
+            
+            # Validation uses 0 noise augmentation level
+            aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
+            
             for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
@@ -793,8 +725,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     lr_ref = z_lr.to(COMPUTE_DTYPE)
                     model_in = torch.cat([latents.to(COMPUTE_DTYPE), lr_ref], dim=1)
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, mask=None, data_info=data_info, adapter_cond=None, injection_mode="hybrid", force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=None, injection_mode="hybrid", force_drop_ids=drop_uncond)
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, injection_mode="hybrid", force_drop_ids=drop_cond)
                     if out_uncond.shape[1] == 8: out_uncond, _ = out_uncond.chunk(2, dim=1)
                     if out_cond.shape[1] == 8: out_cond, _ = out_cond.chunk(2, dim=1)
                     out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
@@ -821,7 +753,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     pixart.train(); adapter.train()
     return results
 
-# ================= 8. Main =================
+# ================= 9. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
@@ -832,7 +764,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True, worker_init_fn=seed_worker, generator=dl_gen)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
-    pixart = PixArtMSV7_XL_2(
+    pixart = PixArtMSV8_XL_2(
         input_size=64, in_channels=8, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
     ).to(DEVICE)
@@ -872,10 +804,13 @@ def main():
     # 2. Clipper needs flat tensor list
     params_to_clip = adapter_params + pixart_params
 
+    # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
+    # We will manually calculate v_target and loss.
+    # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
     diffusion = IDDPM(str(1000))
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
-    print("🚀 Defense-Optimized Training Started.")
+    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
 
     for epoch in range(ep_start, 1000):
@@ -889,15 +824,20 @@ def main():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
+            # [V8 Logic] V-Prediction Training
             t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
-            zlr_cond = zl.float()
             
-            if LR_LATENT_NOISE_STD > 0:
-                zlr_cond = zlr_cond + torch.randn_like(zlr_cond) * LR_LATENT_NOISE_STD
+            # [V8 Logic] Conditioning Augmentation
+            # 1. Sample noise level for LR
+            aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (COND_AUG_NOISE_RANGE[1] - COND_AUG_NOISE_RANGE[0]) + COND_AUG_NOISE_RANGE[0]
+            # 2. Add noise to LR
+            zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
+            # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
+            aug_level_emb = aug_noise_level * 1000.0
 
-            cond = adapter(zl.float())
+            cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
             cond_in = cond
             if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
@@ -905,64 +845,62 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=torch.cat([zt, zlr_cond.to(zt.dtype)], dim=1), timestep=t, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
+                # Pass zlr_aug to concat as well (Consistency!)
+                kwargs = dict(x=torch.cat([zt, zlr_aug.to(zt.dtype)], dim=1), timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                 kwargs["force_drop_ids"] = drop_uncond
                 
                 out = pixart(**kwargs)
                 if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
-                eps = out.float()
+                model_pred = out.float()
 
-                w = get_loss_weights(step)
-                loss_mse = F.mse_loss(eps, noise.float())
+                # [V8 Logic] Calculate V-Target
+                # v = alpha * epsilon - sigma * x0
+                alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
+                sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
+                target_v = alpha_t * noise - sigma_t * zh.float()
+                
+                # [V8 Logic] Min-SNR-Gamma Weighting
+                # SNR = alpha^2 / sigma^2
+                snr = (alpha_t**2) / (sigma_t**2)
+                # Min-SNR-Gamma (gamma=5 is standard for V-pred)
+                gamma = 5.0
+                min_snr_gamma = torch.min(snr, torch.tensor(gamma, device=DEVICE))
+                
+                # Loss = MSE(pred_v, target_v) * Min-SNR / SNR (simplified weighting often just min(snr, gamma) / snr_something, but standard implementation is simpler:
+                # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
+                # Here we use simplified MSE on V directly, which is robust.
+                # Optional: Add Min-SNR weighting:
+                loss_weights = min_snr_gamma / snr # This balances the loss
+                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.squeeze()).mean()
 
-                with torch.no_grad():
-                    c1 = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t, zt.shape)
-                    c2 = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t, zt.shape)
-                z0 = c1 * zt.float() - c2 * eps
+                # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
+                z0 = alpha_t * zt.float() - sigma_t * model_pred
 
                 loss_latent_l1 = F.l1_loss(z0, zh.float())
 
+                w = get_loss_weights(step)
+                
                 if w['lpips'] > 0:
                     top = torch.randint(0, 25, (1,), device=DEVICE).item() 
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_crop = z0[..., top:top+40, left:left+40]
                     img_p_raw = vae.decode(z0_crop/vae.config.scaling_factor).sample.clamp(-1,1)
                     img_p_valid = img_p_raw[..., 32:-32, 32:-32]
-                    
                     y0 = top * 8 + 32; x0 = left * 8 + 32
                     img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                    
                     loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
                 else:
                     loss_lpips = torch.tensor(0.0, device=DEVICE)
 
-                if USE_NOISE_CONSISTENCY and w.get("noise_cons", 0.0) > 0 and torch.rand((), device=DEVICE) < NOISE_CONS_PROB:
-                    t2 = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
-                    zt2 = diffusion.q_sample(zh, t2, noise)
-                    kwargs2 = dict(x=torch.cat([zt2, zlr_cond.to(zt2.dtype)], dim=1), timestep=t2, y=y, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
-                    kwargs2["force_drop_ids"] = drop_uncond
-                    with torch.no_grad():
-                        out2 = pixart(**kwargs2)
-                        if out2.shape[1] == 8: out2, _ = out2.chunk(2, dim=1)
-                        eps2 = out2.float()
-                        c1b = _extract_into_tensor(diffusion.sqrt_recip_alphas_cumprod, t2, zt2.shape)
-                        c2b = _extract_into_tensor(diffusion.sqrt_recipm1_alphas_cumprod, t2, zt2.shape)
-                        z0_t2 = c1b * zt2.float() - c2b * eps2
-                    loss_noise_cons = F.l1_loss(z0, z0_t2)
-                else:
-                    loss_noise_cons = torch.tensor(0.0, device=DEVICE)
-
                 loss = (
-                    w['mse']*loss_mse
+                    loss_v 
                     + w['latent_l1']*loss_latent_l1
                     + w['lpips']*loss_lpips
-                    + w.get('noise_cons', 0.0)*loss_noise_cons
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
 
             if (i+1) % GRAD_ACCUM_STEPS == 0:
-                # [FIXED HERE] Use correct parameter list for clipping
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -970,10 +908,9 @@ def main():
 
             if i % 10 == 0:
                 pbar.set_postfix({
-                    'mse': f"{loss_mse:.3f}",
+                    'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'lp': f"{loss_lpips:.3f}",
-                    'ncons': f"{loss_noise_cons:.3f}",
                 })
 
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
