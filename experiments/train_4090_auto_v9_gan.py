@@ -1,12 +1,12 @@
-# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
-# DiTSR v8 Training Script
+# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v9_gan.py
+# DiTSR v9 Training Script (Adversarial Finetuning Phase)
 # ------------------------------------------------------------------
-# Major Refactoring based on "DiT-SR v8 Report":
-# 1. Prediction Type: Switched to "v_prediction" (Velocity) for high-SNR stability.
-# 2. Conditioning: SR3-style augmentation (Augment LR + Pass noise level embedding).
-# 3. Consistency: Same noisy LR condition passed to both Adapter and Concat branch.
-# 4. Initialization: Using Copy-Init in Model V8 to ensure signal visibility at Step 0.
-# 5. Validation: Default to LQ-Init (img2img style) to anchor early predictions.
+# Phase: High-Fidelity Generation (Paper Ready)
+# Base: V8 Structure (V-Pred, Copy-Init, Augmentation)
+# Additions:
+# 1. PatchGAN Discriminator: Adds Adversarial Loss to fix "oil painting" artifacts.
+# 2. EMA (Exponential Moving Average): Stabilizes training, prevents oscillation.
+# 3. Refined Loss Balance: L1 (1.0) + LPIPS (1.0) + GAN (0.02).
 # ------------------------------------------------------------------
 
 import os
@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import io
 import hashlib
 import shutil
+import copy
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -37,33 +38,57 @@ import matplotlib.pyplot as plt
 
 import lpips
 from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers.training_utils import EMAModel
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
-# [Import V8 Model]
+# [Import V8 Model - Keeping the strong foundation]
 from diffusion.model.nets.PixArtMS_v8 import PixArtMSV8_XL_2
 from diffusion.model.nets.adapter_v7 import build_adapter_v7
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
-
-# Added "aug_embedder" to required keys
-V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "input_adaln", "adapter_alpha_mlp", "input_res_proj", "injection_scales", 
-    "input_adapter_ln", "style_fusion_mlp", "aug_embedder"
-)
+V7_REQUIRED_PIXART_KEY_FRAGMENTS = ("input_adaln", "adapter_alpha_mlp", "input_res_proj", "injection_scales", "input_adapter_ln", "style_fusion_mlp", "aug_embedder")
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 
 def get_required_v7_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     required = []
     for frag in V7_REQUIRED_PIXART_KEY_FRAGMENTS:
-        if any(frag in name for name in trainable_names):
-            required.append(frag)
+        if any(frag in name for name in trainable_names): required.append(frag)
     return tuple(required)
 
-# ================= 2. Hyper-parameters =================
+# ================= 2. GAN & Discriminator Implementation =================
+class NLayerDiscriminator(nn.Module):
+    """Defines a PatchGAN discriminator"""
+    def __init__(self, input_nc=3, ndf=64, n_layers=3):
+        super(NLayerDiscriminator, self).__init__()
+        kw = 4; padw = 1
+        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
+        nf_mult = 1; nf_mult_prev = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2 ** n, 8)
+            sequence += [
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=False),
+                nn.BatchNorm2d(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True)
+            ]
+        nf_mult_prev = nf_mult
+        nf_mult = min(2 ** n_layers, 8)
+        sequence += [
+            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=False),
+            nn.BatchNorm2d(ndf * nf_mult),
+            nn.LeakyReLU(0.2, True)
+        ]
+        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]
+        self.main = nn.Sequential(*sequence)
+
+    def forward(self, input):
+        return self.main(input)
+
+# ================= 3. Hyper-parameters =================
 TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
 VAL_HR_DIR   = "/data/DF2K/DF2K_valid_HR"
 VAL_LR_DIR   = "/data/DF2K/DF2K_valid_LR_bicubic/X4"
@@ -73,7 +98,7 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = "/home/hello/HJT/DiTSR/output/null_embed.pth"
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v8")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v9_gan")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -94,36 +119,39 @@ BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
 NUM_WORKERS = 8
 
-LR_BASE = 1e-5 
+# Learning Rates (Differential)
+LR_G_ADAPTER = 5e-5 # Slightly lower for finetuning
+LR_G_BASE = 5e-6    # Slightly lower for finetuning
+LR_D = 1e-4         # Discriminator LR
+
 LORA_RANK = 16
 LORA_ALPHA = 16
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 25
 INJECTION_STRATEGY = "front_dense"
 
-# [V8 Augmentation] Range of noise added to LR condition (SR3 style)
-# This is physically added to the LR Latent.
-COND_AUG_NOISE_RANGE = (0.0, 0.15) 
+# Augmentation (Reduced for refinement phase)
+COND_AUG_NOISE_RANGE = (0.0, 0.05) 
 
-WARMUP_STEPS = 3500          
-RAMP_UP_STEPS = 5000         
-TARGET_LPIPS_WEIGHT = 0.50
-LPIPS_BASE_WEIGHT = 0.0      
+# [V9 GAN Config]
+# GAN Weight: Controls "Realism". Too high = artifacts, Too low = blur.
+GAN_WEIGHT = 0.02 
+TARGET_LPIPS_WEIGHT = 1.0 # Can be higher now because GAN suppresses artifacts
 L1_BASE_WEIGHT = 1.0
 
+# Validation
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
-PSNR_SWITCH = 23.0
+PSNR_SWITCH = 22.5
 KEEP_TOPK = 1
 VAL_MODE = "valpack"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
-CFG_SCALE = 3.0
+CFG_SCALE = 1.5
 
-# [V8 Change] Default to LQ-Init for validation to see anchor immediately
 USE_LQ_INIT = True 
-LQ_INIT_STRENGTH = 0.1 # Start very close to LR
+LQ_INIT_STRENGTH = 0.0 # Strict generation mode
 
 INIT_NOISE_STD = 0.0
 USE_CFG_TRAIN = False
@@ -133,7 +161,7 @@ COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True
 
 USE_LR_CONSISTENCY = False 
-USE_NOISE_CONSISTENCY = False # V-pred makes this tricky, disabled for V8 stability
+USE_NOISE_CONSISTENCY = False
 
 VAE_TILING = False
 DEG_OPS = ["blur", "resize", "noise", "jpeg"]
@@ -144,18 +172,7 @@ BLUR_KERNELS = [7, 9, 11, 13, 15, 21]
 JPEG_QUALITY_RANGE = (30, 95)
 RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.InterpolationMode.BILINEAR, transforms.InterpolationMode.BICUBIC]
 
-# ================= 3. Logic Functions =================
-def get_loss_weights(global_step):
-    weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
-    if global_step < WARMUP_STEPS:
-        weights['lpips'] = 0.0
-    elif global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
-        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS
-        weights['lpips'] = LPIPS_BASE_WEIGHT + (TARGET_LPIPS_WEIGHT - LPIPS_BASE_WEIGHT) * progress
-    else:
-        weights['lpips'] = TARGET_LPIPS_WEIGHT
-    return weights
-
+# ================= 4. Utils =================
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481*r + 128.553*g + 24.966*b) / 255.0
@@ -180,11 +197,8 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     start_index = min(max(start_index, 0), len(timesteps) - 1)
     t_start = timesteps[start_index]
     noise = randn_like_with_generator(z_lr, generator)
-    # V-Prediction / Img2Img Logic
-    if hasattr(scheduler, "add_noise"):
-        latents = scheduler.add_noise(z_lr, noise, t_start)
-    else:
-        latents = z_lr + noise # Fallback
+    if hasattr(scheduler, "add_noise"): latents = scheduler.add_noise(z_lr, noise, t_start)
+    else: latents = z_lr + noise
     return latents.to(dtype=dtype), timesteps[start_index:]
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
@@ -249,9 +263,9 @@ def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
     return counts
 
 def get_config_snapshot():
-    return {"batch_size": BATCH_SIZE, "lr_base": LR_BASE, "lora_rank": LORA_RANK, "v8_config": True}
+    return {"batch_size": BATCH_SIZE, "v9_gan": True}
 
-# ================= 4. Data Pipeline =================
+# ================= 5. Data Pipeline =================
 class DegradationPipeline:
     def __init__(self, crop_size=512):
         self.crop_size = crop_size
@@ -423,7 +437,7 @@ class DegradationPipeline:
         lr_out = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-        # FIXED: Strictly return 2 values
+        # STRICTLY 2 Values
         if return_meta:
             meta_out = {
                 "stage1_blur_applied": torch.tensor(int(stage1["blur_applied"]), dtype=torch.int64),
@@ -437,6 +451,7 @@ class DegradationPipeline:
                 "stage1_resize_scale": torch.tensor(float(stage1["resize_scale"]), dtype=torch.float32),
                 "stage1_resize_interp": torch.tensor(int(stage1["resize_interp_idx"]), dtype=torch.int64),
                 "stage1_jpeg_quality": torch.tensor(int(stage1["jpeg_quality"]), dtype=torch.int64),
+                
                 "stage2_blur_applied": torch.tensor(int(stage2["blur_applied"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_k_size": torch.tensor(int(stage2["k_size"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_sigma": torch.tensor(float(stage2["sigma"]), dtype=torch.float32) if stage2 else torch.tensor(0.0, dtype=torch.float32),
@@ -448,6 +463,7 @@ class DegradationPipeline:
                 "stage2_resize_scale": torch.tensor(float(stage2["resize_scale"]), dtype=torch.float32) if stage2 else torch.tensor(0.0, dtype=torch.float32),
                 "stage2_resize_interp": torch.tensor(int(stage2["resize_interp_idx"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
                 "stage2_jpeg_quality": torch.tensor(int(stage2["jpeg_quality"]), dtype=torch.int64) if stage2 else torch.tensor(0, dtype=torch.int64),
+                
                 "use_two_stage": torch.tensor(int(use_two_stage), dtype=torch.int64),
                 "ops_stage1": ",".join(ops_stage1),
                 "ops_stage2": ",".join(ops_stage2),
@@ -457,7 +473,7 @@ class DegradationPipeline:
             return lr_out, meta_out
         return lr_out
 
-# ================= 5. Datasets =================
+# ================= 6. Datasets =================
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, is_train=True):
         self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
@@ -467,7 +483,6 @@ class DF2K_Online_Dataset(Dataset):
         self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         self.to_tensor = transforms.ToTensor()
         self.epoch = 0
-
     def set_epoch(self, epoch: int): self.epoch = int(epoch)
     def _make_generator(self, idx: int):
         gen = torch.Generator(); seed = SEED + (self.epoch * 1_000_000) + int(idx); gen.manual_seed(seed)
@@ -488,12 +503,7 @@ class DF2K_Online_Dataset(Dataset):
             else: hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         else: hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        if self.is_train and TRAIN_DEG_MODE == "bicubic":
-            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
-            deg_meta = None
-        else: lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
+        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
         return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
@@ -557,7 +567,7 @@ class ValPackDataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
         return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
 
-# ================= 6. LoRA =================
+# ================= 7. LoRA =================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int, alpha: float):
         super().__init__()
@@ -581,7 +591,7 @@ def apply_lora(model, rank=64, alpha=64):
              setattr(parent, child, LoRALinear(module, rank, alpha)); cnt += 1
     print(f"✅ LoRA applied to {cnt} layers.")
 
-# ================= 7. Checkpointing =================
+# ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     if not math.isfinite(psnr_v): return (999, float("inf"))
     if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
@@ -686,15 +696,13 @@ def resume(pixart, adapter, optimizer, dl_gen):
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
-# ================= 8. Validation =================
+# ================= 9. Validation =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
     print(f"🔎 Validating Epoch {epoch+1}...")
     pixart.eval(); adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
-    
-    # [V8 Change] Validation uses V-Prediction scheduler
     scheduler = DDIMScheduler(
         num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
         clip_sample=False, prediction_type="v_prediction", set_alpha_to_one=False,
@@ -708,16 +716,10 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
-            
-            # [V8 Change] Default USE_LQ_INIT=True helps anchoring early training
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
-            
             cond = adapter(z_lr.float())
-            
-            # Validation uses 0 noise augmentation level
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
-            
             for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
@@ -753,7 +755,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     pixart.train(); adapter.train()
     return results
 
-# ================= 9. Main =================
+# ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
@@ -768,6 +770,7 @@ def main():
         input_size=64, in_channels=8, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
     ).to(DEVICE)
+    # Re-init weights if starting fresh, or load checkpoint
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
@@ -777,9 +780,16 @@ def main():
         w8[:, :4] = w4; base["x_embedder.proj.weight"] = w8
     pixart.load_pretrained_weights_with_zero_init(base)
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
-    pixart.train()
-
+    
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(DEVICE).float().train()
+    
+    # [EMA Setup]
+    ema_pixart = EMAModel(pixart.parameters(), decay=0.999)
+    ema_adapter = EMAModel(adapter.parameters(), decay=0.999)
+    
+    # [Discriminator Setup]
+    discriminator = NLayerDiscriminator(input_nc=3).to(DEVICE).train()
+    
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
@@ -790,27 +800,19 @@ def main():
     y = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE)
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # [FIXED HERE] Separate Optimizer Groups from Clipping List
-    adapter_params = list(adapter.parameters())
-    pixart_params = [p for p in pixart.parameters() if p.requires_grad]
+    # Optimizers
+    g_params = [{"params": list(adapter.parameters()), "lr": LR_G_ADAPTER}, {"params": [p for p in pixart.parameters() if p.requires_grad], "lr": LR_G_BASE}]
+    optimizer_G = torch.optim.AdamW(g_params)
+    optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=LR_D, betas=(0.5, 0.999))
     
-    # 1. Optimizer needs groups (dicts)
-    optim_groups = [
-        {"params": adapter_params, "lr": 1e-4}, 
-        {"params": pixart_params, "lr": 1e-5}
-    ]
-    optimizer = torch.optim.AdamW(optim_groups) 
-    
-    # 2. Clipper needs flat tensor list
-    params_to_clip = adapter_params + pixart_params
+    g_params_to_clip = list(adapter.parameters()) + [p for p in pixart.parameters() if p.requires_grad]
 
-    # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
-    # We will manually calculate v_target and loss.
-    # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
     diffusion = IDDPM(str(1000))
-    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
+    ep_start, step, best = resume(pixart, adapter, optimizer_G, dl_gen)
+    # Note: resume function only loads G optim. In a real long run, you'd save D state too. 
+    # For now, starting D from scratch at Ep34 is fine as it learns fast.
 
-    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
+    print("🚀 DiT-SR V9 Adversarial Training Started.")
     max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
 
     for epoch in range(ep_start, 1000):
@@ -824,99 +826,119 @@ def main():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
-            # [V8 Logic] V-Prediction Training
+            # --- Generator Step ---
             t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
-            # [V8 Logic] Conditioning Augmentation
-            # 1. Sample noise level for LR
             aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (COND_AUG_NOISE_RANGE[1] - COND_AUG_NOISE_RANGE[0]) + COND_AUG_NOISE_RANGE[0]
-            # 2. Add noise to LR
             zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
-            # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = aug_noise_level * 1000.0
 
-            cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
+            cond = adapter(zlr_aug.float())
             cond_in = cond
             if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
                 cond_in = mask_adapter_cond(cond, keep)
 
+            # Train Generator
+            # We skip D training every other step to balance speed if needed, but standard is 1:1.
+            
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                # Pass zlr_aug to concat as well (Consistency!)
                 kwargs = dict(x=torch.cat([zt, zlr_aug.to(zt.dtype)], dim=1), timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                 kwargs["force_drop_ids"] = drop_uncond
-                
                 out = pixart(**kwargs)
                 if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
                 model_pred = out.float()
 
-                # [V8 Logic] Calculate V-Target
-                # v = alpha * epsilon - sigma * x0
                 alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
                 target_v = alpha_t * noise - sigma_t * zh.float()
                 
-                # [V8 Logic] Min-SNR-Gamma Weighting
-                # SNR = alpha^2 / sigma^2
-                snr = (alpha_t**2) / (sigma_t**2)
-                # Min-SNR-Gamma (gamma=5 is standard for V-pred)
-                gamma = 5.0
-                min_snr_gamma = torch.min(snr, torch.tensor(gamma, device=DEVICE))
+                loss_v = F.mse_loss(model_pred, target_v) # Simplified V-loss
+                z0 = alpha_t * zt.float() - sigma_t * model_pred # Reconstruct z0
                 
-                # Loss = MSE(pred_v, target_v) * Min-SNR / SNR (simplified weighting often just min(snr, gamma) / snr_something, but standard implementation is simpler:
-                # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
-                # Here we use simplified MSE on V directly, which is robust.
-                # Optional: Add Min-SNR weighting:
-                loss_weights = min_snr_gamma / snr # This balances the loss
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.squeeze()).mean()
-
-                # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
-                z0 = alpha_t * zt.float() - sigma_t * model_pred
-
                 loss_latent_l1 = F.l1_loss(z0, zh.float())
 
-                w = get_loss_weights(step)
+                # Perceptual & GAN Loss (Pixel Space)
+                # Decode SMALL crop to save VRAM
+                top = torch.randint(0, 25, (1,), device=DEVICE).item() 
+                left = torch.randint(0, 25, (1,), device=DEVICE).item()
+                z0_crop = z0[..., top:top+40, left:left+40]
+                img_p_raw = vae.decode(z0_crop/vae.config.scaling_factor).sample.clamp(-1,1)
+                img_p_valid = img_p_raw[..., 32:-32, 32:-32] # 256x256 valid pixels
                 
-                if w['lpips'] > 0:
-                    top = torch.randint(0, 25, (1,), device=DEVICE).item() 
-                    left = torch.randint(0, 25, (1,), device=DEVICE).item()
-                    z0_crop = z0[..., top:top+40, left:left+40]
-                    img_p_raw = vae.decode(z0_crop/vae.config.scaling_factor).sample.clamp(-1,1)
-                    img_p_valid = img_p_raw[..., 32:-32, 32:-32]
-                    y0 = top * 8 + 32; x0 = left * 8 + 32
-                    img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                    loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
-                else:
-                    loss_lpips = torch.tensor(0.0, device=DEVICE)
+                y0 = top * 8 + 32; x0 = left * 8 + 32
+                img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1) # Real HR patch
+                
+                loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+                
+                # GAN Loss (Generator side)
+                # We want D to classify fake as real (1)
+                pred_fake = discriminator(img_p_valid)
+                loss_gan = -torch.mean(pred_fake) # Hinge-like generator loss or WGAN style
 
-                loss = (
+                # Total G Loss
+                loss_G = (
                     loss_v 
-                    + w['latent_l1']*loss_latent_l1
-                    + w['lpips']*loss_lpips
+                    + L1_BASE_WEIGHT * loss_latent_l1
+                    + TARGET_LPIPS_WEIGHT * loss_lpips
+                    + GAN_WEIGHT * loss_gan
                 ) / GRAD_ACCUM_STEPS
 
-            loss.backward()
+            loss_G.backward()
+
+            # --- Discriminator Step ---
+            # Detach z0 to stop gradients flowing back to G
+            img_p_detached = img_p_valid.detach()
+            
+            with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                pred_real = discriminator(img_t_valid)
+                pred_fake_d = discriminator(img_p_detached)
+                
+                # Hinge Loss for D
+                loss_D_real = torch.nn.ReLU()(1.0 - pred_real).mean()
+                loss_D_fake = torch.nn.ReLU()(1.0 + pred_fake_d).mean()
+                loss_D = (loss_D_real + loss_D_fake) * 0.5 / GRAD_ACCUM_STEPS
+
+            loss_D.backward()
 
             if (i+1) % GRAD_ACCUM_STEPS == 0:
-                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                torch.nn.utils.clip_grad_norm_(g_params_to_clip, 1.0)
+                optimizer_G.step()
+                optimizer_G.zero_grad()
+                optimizer_D.step()
+                optimizer_D.zero_grad()
+                
+                # Update EMA
+                ema_pixart.step(pixart.parameters())
+                ema_adapter.step(adapter.parameters())
+                
                 step += 1
 
             if i % 10 == 0:
                 pbar.set_postfix({
-                    'v_loss': f"{loss_v:.3f}",
-                    'lat_l1': f"{loss_latent_l1:.3f}",
+                    'v': f"{loss_v:.3f}",
                     'lp': f"{loss_lpips:.3f}",
+                    'gan': f"{loss_gan:.3f}",
+                    'd': f"{loss_D.item()*GRAD_ACCUM_STEPS:.3f}"
                 })
 
+        # Validation uses EMA weights
+        ema_pixart.store(pixart.parameters())
+        ema_adapter.store(adapter.parameters())
+        ema_pixart.copy_to(pixart.parameters())
+        ema_adapter.copy_to(adapter.parameters())
+        
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
+        
+        ema_pixart.restore(pixart.parameters())
+        ema_adapter.restore(adapter.parameters())
+        
         if int(BEST_VAL_STEPS) in val_dict: metrics = val_dict[int(BEST_VAL_STEPS)]
         else: metrics = next(iter(val_dict.values()))
-        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen)
+        best = save_smart(epoch, step, pixart, adapter, optimizer_G, best, metrics, dl_gen)
 
 if __name__ == "__main__":
     main()
