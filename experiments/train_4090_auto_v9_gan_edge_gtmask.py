@@ -204,6 +204,8 @@ EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
 EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
+EDGE_WARMUP_STEPS = 3000
+EDGE_RAMP_STEPS = 4000
 
 LPIPS_TARGET_WEIGHT = 0.5 
 LPIPS_WARMUP_STEPS = 0    
@@ -343,7 +345,10 @@ def get_stage2_loss_weights(global_step: int):
     gan_w = 0.0
     if global_step >= GAN_WARMUP_STEPS:
         gan_w = _ramp_weight(global_step, GAN_WARMUP_STEPS, GAN_RAMP_STEPS, GAN_TARGET_WEIGHT)
-    return lpips_w, gan_w
+    edge_scale = _ramp_weight(global_step, EDGE_WARMUP_STEPS, EDGE_RAMP_STEPS, 1.0)
+    edge_w = EDGE_GRAD_WEIGHT * edge_scale
+    flat_w = FLAT_HF_WEIGHT * edge_scale
+    return lpips_w, gan_w, edge_w, flat_w
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None: return None
@@ -1114,12 +1119,17 @@ def main():
                 
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_flat_hf = torch.tensor(0.0, device=DEVICE)
+                loss_ffl = torch.tensor(0.0, device=DEVICE)
                 if FFL_BASE_WEIGHT > 0:
                     loss_ffl = ffl_criterion(img_p_valid, img_t_valid)
 
                 # GAN Loss (Generator side)
                 loss_gan = torch.tensor(0.0, device=DEVICE)
-                lpips_w, gan_w = get_stage2_loss_weights(step)
+                lpips_w, gan_w, edge_w, flat_w = get_stage2_loss_weights(step)
+                if edge_w > 0 or flat_w > 0:
+                    loss_edge, loss_flat_hf, _ = edge_guided_losses(
+                        img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
+                    )
 
                 # [FIX] Only compute G's GAN loss if weight > 0
                 if gan_w > 0:
@@ -1133,7 +1143,7 @@ def main():
                     + L1_BASE_WEIGHT * loss_latent_l1
                     + lpips_w * loss_lpips
                     + gan_w * loss_gan
-                    + EDGE_GRAD_WEIGHT * loss_edge + FLAT_HF_WEIGHT * loss_flat_hf  # edge-guided
+                    + edge_w * loss_edge + flat_w * loss_flat_hf  # edge-guided
                 ) / GRAD_ACCUM_STEPS
 
             loss_G.backward()
@@ -1196,6 +1206,8 @@ def main():
                     'd_loss': f"{loss_D_val:.3f}",
                     'w_lp': f"{lpips_w:.3f}",
                     'w_gan': f"{gan_w:.3f}",
+                    'w_edge': f"{edge_w:.3f}",
+                    'w_flat': f"{flat_w:.3f}",
                 })
 
         # Validation uses EMA weights

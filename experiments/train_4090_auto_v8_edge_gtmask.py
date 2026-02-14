@@ -116,6 +116,8 @@ EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
 EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
+EDGE_WARMUP_STEPS = 3000
+EDGE_RAMP_STEPS = 4000
 
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
@@ -160,6 +162,15 @@ def get_loss_weights(global_step):
         weights['lpips'] = LPIPS_BASE_WEIGHT + (TARGET_LPIPS_WEIGHT - LPIPS_BASE_WEIGHT) * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
+
+    if global_step < EDGE_WARMUP_STEPS:
+        edge_progress = 0.0
+    elif EDGE_RAMP_STEPS <= 0:
+        edge_progress = 1.0
+    else:
+        edge_progress = min(1.0, (global_step - EDGE_WARMUP_STEPS) / EDGE_RAMP_STEPS)
+    weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
+    weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
     return weights
 
 def rgb01_to_y01(rgb01):
@@ -991,8 +1002,9 @@ def main():
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_flat_hf = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                loss_ffl = torch.tensor(0.0, device=DEVICE)
 
-                if w['lpips'] > 0 or (EDGE_GRAD_WEIGHT > 0 or FLAT_HF_WEIGHT > 0):
+                if w['lpips'] > 0 or (w['edge_grad'] > 0 or w['flat_hf'] > 0):
                     top = torch.randint(0, 25, (1,), device=DEVICE).item() 
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_crop = z0[..., top:top+40, left:left+40]
@@ -1003,6 +1015,11 @@ def main():
                     
                     if w['lpips'] > 0:
                         loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+
+                    if w['edge_grad'] > 0 or w['flat_hf'] > 0:
+                        loss_edge, loss_flat_hf, _ = edge_guided_losses(
+                            img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
+                        )
                     
                     # [New] Compute FFL (with float32 cast fix)
                     if FFL_BASE_WEIGHT > 0:
@@ -1012,7 +1029,7 @@ def main():
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
                     + w['lpips']*loss_lpips
-                    + EDGE_GRAD_WEIGHT * loss_edge + FLAT_HF_WEIGHT * loss_flat_hf 
+                    + w['edge_grad'] * loss_edge + w['flat_hf'] * loss_flat_hf 
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
@@ -1028,6 +1045,10 @@ def main():
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'lp': f"{loss_lpips:.3f}",
+                    'edge': f"{loss_edge.item():.3f}",
+                    'flat_hf': f"{loss_flat_hf.item():.3f}",
+                    'w_edge': f"{w['edge_grad']:.3f}",
+                    'w_flat': f"{w['flat_hf']:.3f}",
                     'ffl': f"{loss_ffl.item():.4f}",
                 })
 
