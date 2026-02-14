@@ -215,6 +215,8 @@ LPIPS_RAMP_STEPS = 5000
 GAN_TARGET_WEIGHT = 0.08  # Lowered from 0.1 for stability
 GAN_WARMUP_STEPS = 2000   # Extended warmup
 GAN_RAMP_STEPS = 4000     
+# If resuming from a legacy v8 checkpoint, restart GAN warmup from handover step.
+GAN_WARMUP_FROM_V8_HANDOVER = True
 
 # Validation
 VAL_STEPS_LIST = [50]
@@ -340,11 +342,13 @@ def _ramp_weight(global_step: int, warmup_steps: int, ramp_steps: int, target: f
     t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
     return float(target) * float(t)
 
-def get_stage2_loss_weights(global_step: int):
+def get_stage2_loss_weights(global_step: int, gan_step_for_schedule: int = None):
     lpips_w = _ramp_weight(global_step, LPIPS_WARMUP_STEPS, LPIPS_RAMP_STEPS, LPIPS_TARGET_WEIGHT)
+    if gan_step_for_schedule is None:
+        gan_step_for_schedule = global_step
     gan_w = 0.0
-    if global_step >= GAN_WARMUP_STEPS:
-        gan_w = _ramp_weight(global_step, GAN_WARMUP_STEPS, GAN_RAMP_STEPS, GAN_TARGET_WEIGHT)
+    if gan_step_for_schedule >= GAN_WARMUP_STEPS:
+        gan_w = _ramp_weight(gan_step_for_schedule, GAN_WARMUP_STEPS, GAN_RAMP_STEPS, GAN_TARGET_WEIGHT)
     edge_scale = _ramp_weight(global_step, EDGE_WARMUP_STEPS, EDGE_RAMP_STEPS, 1.0)
     edge_w = EDGE_GRAD_WEIGHT * edge_scale
     flat_w = FLAT_HF_WEIGHT * edge_scale
@@ -842,7 +846,7 @@ def optimizer_to_device(optimizer, device):
                 state[k] = v.to(device)
 
 def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen):
-    if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
+    if not os.path.exists(LAST_CKPT_PATH): return 0, 0, [], False
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     saved_trainable = ckpt.get("pixart_trainable", {})
@@ -863,8 +867,10 @@ def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart,
     pixart.load_state_dict(curr, strict=False)
     
     # [CRITICAL FIX] Resume G, D, Opt_D, and EMA
+    resumed_from_legacy_v8 = False
     if "optimizer" in ckpt: # Support legacy v8 checkpoints
         optimizer_G.load_state_dict(ckpt["optimizer"])
+        resumed_from_legacy_v8 = True
         print("⚠️ Loaded Optimizer G from legacy 'optimizer' key (v8 transition).")
     elif "optimizer_G" in ckpt:
         optimizer_G.load_state_dict(ckpt["optimizer_G"])
@@ -914,7 +920,7 @@ def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart,
     if dl_state is not None:
         try: dl_gen.set_state(dl_state)
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
-    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
+    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), resumed_from_legacy_v8
 
 # ================= 8. Validation (Moved BEFORE Main) =================
 @torch.no_grad()
@@ -1045,7 +1051,11 @@ def main():
 
     diffusion = IDDPM(str(1000))
     # [CRITICAL FIX] Pass all state objects to resume
-    ep_start, step, best = resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen)
+    ep_start, step, best, resumed_from_legacy_v8 = resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen)
+    gan_step_offset = 0
+    if GAN_WARMUP_FROM_V8_HANDOVER and resumed_from_legacy_v8:
+        gan_step_offset = step
+        print(f"ℹ️ GAN warmup schedule reset at v8->v9 handover step={step}. Effective GAN step starts from 0.")
 
     _ema_to_device(ema_pixart, DEVICE)
     _ema_to_device(ema_adapter, DEVICE)  # safety: keep EMA tensors on GPU
@@ -1125,7 +1135,8 @@ def main():
 
                 # GAN Loss (Generator side)
                 loss_gan = torch.tensor(0.0, device=DEVICE)
-                lpips_w, gan_w, edge_w, flat_w = get_stage2_loss_weights(step)
+                gan_step_for_schedule = max(0, step - gan_step_offset)
+                lpips_w, gan_w, edge_w, flat_w = get_stage2_loss_weights(step, gan_step_for_schedule=gan_step_for_schedule)
                 if edge_w > 0 or flat_w > 0:
                     loss_edge, loss_flat_hf, _ = edge_guided_losses(
                         img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
