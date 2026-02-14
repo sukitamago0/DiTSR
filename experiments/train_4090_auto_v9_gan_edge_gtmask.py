@@ -160,7 +160,8 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = "/home/hello/HJT/DiTSR/output/null_embed.pth"
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v9_gan")
+OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
+OUT_DIR = os.path.join(OUT_BASE, "train_4090_auto_v9_gan")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -198,7 +199,11 @@ COND_AUG_NOISE_RANGE = (0.0, 0.15)
 
 # [V9 GAN Config]
 L1_BASE_WEIGHT = 1.0
-FFL_BASE_WEIGHT = 0.01
+FFL_BASE_WEIGHT = 0.0  # disabled (replaced by GT-edge-guided losses)
+EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
+FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
+EDGE_Q           = 0.90     # GT edge quantile for normalization
+EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
 
 LPIPS_TARGET_WEIGHT = 0.5 
 LPIPS_WARMUP_STEPS = 0    
@@ -248,6 +253,57 @@ RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.Interpol
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481*r + 128.553*g + 24.966*b) / 255.0
+
+# ----------------- Edge-guided perceptual regularizers (GT-driven) -----------------
+# Goal: (1) match gradients where GT has edges, (2) suppress high-frequency hallucinations where GT is flat/defocused.
+_SOBEL_X = torch.tensor([[1, 0, -1],
+                        [2, 0, -2],
+                        [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_SOBEL_Y = torch.tensor([[1, 2, 1],
+                        [0, 0, 0],
+                        [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_LAPLACE = torch.tensor([[0, 1, 0],
+                        [1, -4, 1],
+                        [0, 1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
+
+def _to_luma01(img_m11: torch.Tensor) -> torch.Tensor:
+    # img in [-1,1], returns luma in [0,1], shape [B,1,H,W], float32
+    img01 = (img_m11.float() + 1.0) * 0.5
+    r = img01[:, 0:1]; g = img01[:, 1:2]; b = img01[:, 2:3]
+    luma = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    return luma.clamp(0.0, 1.0)
+
+@torch.cuda.amp.autocast(enabled=False)
+def edge_mask_from_gt(gt_m11: torch.Tensor, q: float = 0.90, pow_: float = 0.50, eps: float = 1e-6) -> torch.Tensor:
+    # Return mask in [0,1], high on GT edges, low on flat/defocus regions.
+    x = _to_luma01(gt_m11)
+    kx = _SOBEL_X.to(device=x.device); ky = _SOBEL_Y.to(device=x.device)
+    gx = F.conv2d(x, kx, padding=1)
+    gy = F.conv2d(x, ky, padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy + eps)
+    # Robust normalization using per-image quantile (prevents a few strong edges from saturating everything).
+    flat = mag.flatten(1)
+    denom = torch.quantile(flat, q, dim=1, keepdim=True).clamp_min(eps)
+    m = (flat / denom).view_as(mag).clamp(0.0, 1.0)
+    if pow_ != 1.0:
+        m = m.pow(pow_)
+    return m
+
+@torch.cuda.amp.autocast(enabled=False)
+def edge_guided_losses(pred_m11: torch.Tensor, gt_m11: torch.Tensor, q: float = 0.90, pow_: float = 0.50, eps: float = 1e-6):
+    # pred/gt in [-1,1], shape [B,3,H,W]
+    m = edge_mask_from_gt(gt_m11, q=q, pow_=pow_, eps=eps)  # [B,1,H,W]
+    p = _to_luma01(pred_m11); g = _to_luma01(gt_m11)
+    kx = _SOBEL_X.to(device=p.device); ky = _SOBEL_Y.to(device=p.device); kl = _LAPLACE.to(device=p.device)
+    pgx = F.conv2d(p, kx, padding=1); pgy = F.conv2d(p, ky, padding=1)
+    ggx = F.conv2d(g, kx, padding=1); ggy = F.conv2d(g, ky, padding=1)
+    # (A) Edge matching: only care where GT has edges (prevents "inventing edges" in defocus).
+    loss_edge = (m * (pgx - ggx).abs() + m * (pgy - ggy).abs()).mean()
+    # (B) HF suppression on flat regions: penalize Laplacian energy where GT is flat/defocused.
+    plap = F.conv2d(p, kl, padding=1)
+    loss_flat_hf = ((1.0 - m) * plap.abs()).mean()
+    return loss_edge, loss_flat_hf, m
+# -------------------------------------------------------------------------------
 
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -760,6 +816,20 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, optimizer_D, disc
         except Exception as e: print(f"❌ Failed to save best checkpoint: {e}")
     return best_records
 
+def _ema_to_device(ema, device):
+    # diffusers.EMAModel may keep shadow params on CPU after load_state_dict; move them to match model params.
+    for attr in ("shadow_params", "collected_params"):
+        if hasattr(ema, attr):
+            val = getattr(ema, attr)
+            if isinstance(val, list):
+                new_val = []
+                for t in val:
+                    if torch.is_tensor(t):
+                        new_val.append(t.to(device))
+                    else:
+                        new_val.append(t)
+                setattr(ema, attr, new_val)
+
 def optimizer_to_device(optimizer, device):
     for state in optimizer.state.values():
         for k, v in state.items():
@@ -825,6 +895,8 @@ def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart,
     optimizer_to_device(optimizer_G, DEVICE)
     optimizer_to_device(optimizer_D, DEVICE)
 
+    _ema_to_device(ema_pixart, DEVICE)
+    _ema_to_device(ema_adapter, DEVICE)
     rs = ckpt.get("rng_state", None)
     if rs is not None:
         try:
@@ -965,12 +1037,13 @@ def main():
     g_params_to_clip = adapter_params + embedder_params + other_pixart_params
 
     # [FIX] Initialize FFL Criterion
-    ffl_criterion = FocalFrequencyLoss(loss_weight=FFL_BASE_WEIGHT).to(DEVICE)
 
     diffusion = IDDPM(str(1000))
     # [CRITICAL FIX] Pass all state objects to resume
     ep_start, step, best = resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen)
 
+    _ema_to_device(ema_pixart, DEVICE)
+    _ema_to_device(ema_adapter, DEVICE)  # safety: keep EMA tensors on GPU
     print("🚀 DiT-SR V9 Adversarial Training Started (InstanceNorm D, Correct Grad Flow, FFL, State Saving).")
     max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
 
@@ -1039,7 +1112,8 @@ def main():
                 with torch.cuda.amp.autocast(enabled=False):
                         loss_lpips = lpips_fn(img_p_valid.float(), img_t_valid.float()).mean()
                 
-                loss_ffl = torch.tensor(0.0, device=DEVICE)
+                loss_edge = torch.tensor(0.0, device=DEVICE)
+                loss_flat_hf = torch.tensor(0.0, device=DEVICE)
                 if FFL_BASE_WEIGHT > 0:
                     loss_ffl = ffl_criterion(img_p_valid, img_t_valid)
 
@@ -1059,7 +1133,7 @@ def main():
                     + L1_BASE_WEIGHT * loss_latent_l1
                     + lpips_w * loss_lpips
                     + gan_w * loss_gan
-                    + loss_ffl # Add FFL
+                    + EDGE_GRAD_WEIGHT * loss_edge + FLAT_HF_WEIGHT * loss_flat_hf  # edge-guided
                 ) / GRAD_ACCUM_STEPS
 
             loss_G.backward()
@@ -1116,7 +1190,8 @@ def main():
                     'v': f"{loss_v.item():.3f}",
                     'l1': f"{loss_latent_l1.item():.3f}",
                     'lp': f"{loss_lpips.item():.3f}",
-                    'ffl': f"{loss_ffl.item():.3f}",
+                    'edge': f"{loss_edge.item():.3f}",
+                    'flat_hf': f"{loss_flat_hf.item():.3f}",
                     'gan': f"{loss_gan.item():.3f}",
                     'd_loss': f"{loss_D_val:.3f}",
                     'w_lp': f"{lpips_w:.3f}",

@@ -1,13 +1,12 @@
-# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v9_gan.py
-# DiTSR v9 Training Script (Adversarial Finetuning Phase - Final Corrected v6)
+# /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
+# DiTSR v8 Training Script
 # ------------------------------------------------------------------
-# Fixes v6 (The "No More Errors" Edition):
-# 1. [Structure] Restored `set_requires_grad` function definition.
-# 2. [Loss] Restored Min-SNR-Gamma weighting for V-Prediction (Critical).
-# 3. [GAN] Corrected Adam betas to (0.5, 0.999).
-# 4. [FFL] Restored Standard FFL (stack real/imag) for phase sensitivity.
-# 5. [GAN] Added R1 Gradient Penalty for Discriminator stability.
-# 6. [Config] Tuned GAN Warmup (2000) and Weight (0.08).
+# Major Refactoring based on "DiT-SR v8 Report":
+# 1. Prediction Type: Switched to "v_prediction" (Velocity) for high-SNR stability.
+# 2. Conditioning: SR3-style augmentation (Augment LR + Pass noise level embedding).
+# 3. Consistency: Same noisy LR condition passed to both Adapter and Concat branch.
+# 4. Initialization: Using Copy-Init in Model V8 to ensure signal visibility at Step 0.
+# 5. Validation: Default to LQ-Init (img2img style) to anchor early predictions.
 # ------------------------------------------------------------------
 
 import os
@@ -29,7 +28,6 @@ import torch.nn.functional as F
 import io
 import hashlib
 import shutil
-import copy
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -39,7 +37,6 @@ import matplotlib.pyplot as plt
 
 import lpips
 from diffusers import AutoencoderKL, DDIMScheduler
-from diffusers.training_utils import EMAModel
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
@@ -66,91 +63,7 @@ def get_required_v7_key_fragments_for_model(model: nn.Module):
             required.append(frag)
     return tuple(required)
 
-# ================= 2. GAN & Discriminator Implementation =================
-class NLayerDiscriminator(nn.Module):
-    """Defines a PatchGAN discriminator"""
-    def __init__(self, input_nc=3, ndf=64, n_layers=3):
-        super(NLayerDiscriminator, self).__init__()
-        kw = 4; padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
-        nf_mult = 1; nf_mult_prev = 1
-        for n in range(1, n_layers):
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=False),
-                # InstanceNorm for stability with BS=1
-                nn.InstanceNorm2d(ndf * nf_mult, affine=True, track_running_stats=False), 
-                nn.LeakyReLU(0.2, True)
-            ]
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=False),
-            nn.InstanceNorm2d(ndf * nf_mult, affine=True, track_running_stats=False),
-            nn.LeakyReLU(0.2, True)
-        ]
-        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]
-        self.main = nn.Sequential(*sequence)
-
-    def forward(self, input):
-        return self.main(input.float())
-
-def ema_to_device_(ema, device: str):
-    # 优先走可能存在的官方 to()
-    if hasattr(ema, "to"):
-        try:
-            ema.to(device)
-            return
-        except Exception:
-            pass
-
-    # 手动搬运常见字段
-    for attr in ("shadow_params", "collected_params"):
-        if hasattr(ema, attr):
-            v = getattr(ema, attr)
-            if isinstance(v, (list, tuple)):
-                moved = []
-                for t in v:
-                    moved.append(t.to(device) if torch.is_tensor(t) else t)
-                setattr(ema, attr, moved if isinstance(v, list) else type(v)(moved))
-
-    # 兜底：把 ema.__dict__ 里所有 Tensor 都搬过去（通常很安全）
-    for k, v in list(getattr(ema, "__dict__", {}).items()):
-        if torch.is_tensor(v):
-            ema.__dict__[k] = v.to(device)
-
-
-# [FIX 1] Restored Helper Function
-def set_requires_grad(module: nn.Module, requires_grad: bool):
-    for p in module.parameters():
-        p.requires_grad_(requires_grad)
-
-# [FIX 4] Standard FFL (Stack Real/Imag)
-class FocalFrequencyLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, alpha=1.0):
-        super(FocalFrequencyLoss, self).__init__()
-        self.loss_weight = loss_weight
-        self.alpha = alpha
-
-    @torch.cuda.amp.autocast(enabled=False)
-    def forward(self, pred, target):
-        pred = pred.float()
-        target = target.float()
-        
-        # Calculate 2D FFT
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-        target_fft = torch.fft.fft2(target, dim=(-2, -1))
-        
-        # [Standard FFL] Stack real and imag parts for phase sensitivity
-        pred_stack = torch.stack([pred_fft.real, pred_fft.imag], -1)
-        target_stack = torch.stack([target_fft.real, target_fft.imag], -1)
-        
-        diff = pred_stack - target_stack
-        loss = torch.mean(diff ** 2) 
-        return loss * self.loss_weight
-
-# ================= 3. Hyper-parameters =================
+# ================= 2. Hyper-parameters =================
 TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
 VAL_HR_DIR   = "/data/DF2K/DF2K_valid_HR"
 VAL_LR_DIR   = "/data/DF2K/DF2K_valid_LR_bicubic/X4"
@@ -160,7 +73,7 @@ PIXART_PATH = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "PixArt-
 VAE_PATH    = os.path.join(PROJECT_ROOT, "output", "pretrained_models", "sd-vae-ft-ema")
 T5_EMBED_PATH = "/home/hello/HJT/DiTSR/output/null_embed.pth"
 
-OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v9_gan")
+OUT_DIR = os.path.join(PROJECT_ROOT, "experiments_results", "train_4090_auto_v8")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -177,16 +90,11 @@ FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
 FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
 FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
 
-# --- User Config Block Start ---
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
 NUM_WORKERS = 8
 
-# Learning Rates (Differential)
-LR_G_ADAPTER = 1e-4 
-LR_G_BASE = 1e-5    
-LR_D = 1e-4         
-
+LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
 SPARSE_INJECT_RATIO = 1.0
@@ -194,22 +102,15 @@ INJECTION_CUTOFF_LAYER = 25
 INJECTION_STRATEGY = "front_dense"
 
 # [V8 Augmentation] Range of noise added to LR condition (SR3 style)
+# This is physically added to the LR Latent.
 COND_AUG_NOISE_RANGE = (0.0, 0.15) 
 
-# [V9 GAN Config]
+WARMUP_STEPS = 4500         
+RAMP_UP_STEPS = 5000         
+TARGET_LPIPS_WEIGHT = 0.50
+LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
-FFL_BASE_WEIGHT = 0.01
 
-LPIPS_TARGET_WEIGHT = 0.5 
-LPIPS_WARMUP_STEPS = 0    
-LPIPS_RAMP_STEPS = 5000   
-
-# [FIX 6] Tuned GAN Hyperparams
-GAN_TARGET_WEIGHT = 0.08  # Lowered from 0.1 for stability
-GAN_WARMUP_STEPS = 2000   # Extended warmup
-GAN_RAMP_STEPS = 4000     
-
-# Validation
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
 PSNR_SWITCH = 24.0
@@ -218,11 +119,11 @@ VAL_MODE = "valpack"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
+CFG_SCALE = 3.0
 
-# V9 Validation Settings
-CFG_SCALE = 3.0 
+# [V8 Change] Default to LQ-Init for validation to see anchor immediately
 USE_LQ_INIT = True 
-LQ_INIT_STRENGTH = 0.1 
+LQ_INIT_STRENGTH = 0.1 # Start very close to LR
 
 INIT_NOISE_STD = 0.0
 USE_CFG_TRAIN = False
@@ -232,8 +133,7 @@ COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True
 
 USE_LR_CONSISTENCY = False 
-USE_NOISE_CONSISTENCY = False
-# --- User Config Block End ---
+USE_NOISE_CONSISTENCY = False # V-pred makes this tricky, disabled for V8 stability
 
 VAE_TILING = False
 DEG_OPS = ["blur", "resize", "noise", "jpeg"]
@@ -244,7 +144,18 @@ BLUR_KERNELS = [7, 9, 11, 13, 15, 21]
 JPEG_QUALITY_RANGE = (30, 95)
 RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.InterpolationMode.BILINEAR, transforms.InterpolationMode.BICUBIC]
 
-# ================= 4. Utils =================
+# ================= 3. Logic Functions =================
+def get_loss_weights(global_step):
+    weights = {'mse': 1.0, 'latent_l1': L1_BASE_WEIGHT}
+    if global_step < WARMUP_STEPS:
+        weights['lpips'] = 0.0
+    elif global_step < (WARMUP_STEPS + RAMP_UP_STEPS):
+        progress = (global_step - WARMUP_STEPS) / RAMP_UP_STEPS
+        weights['lpips'] = LPIPS_BASE_WEIGHT + (TARGET_LPIPS_WEIGHT - LPIPS_BASE_WEIGHT) * progress
+    else:
+        weights['lpips'] = TARGET_LPIPS_WEIGHT
+    return weights
+
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481*r + 128.553*g + 24.966*b) / 255.0
@@ -269,25 +180,12 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     start_index = min(max(start_index, 0), len(timesteps) - 1)
     t_start = timesteps[start_index]
     noise = randn_like_with_generator(z_lr, generator)
-    if hasattr(scheduler, "add_noise"): latents = scheduler.add_noise(z_lr, noise, t_start)
-    else: latents = z_lr + noise
+    # V-Prediction / Img2Img Logic
+    if hasattr(scheduler, "add_noise"):
+        latents = scheduler.add_noise(z_lr, noise, t_start)
+    else:
+        latents = z_lr + noise # Fallback
     return latents.to(dtype=dtype), timesteps[start_index:]
-
-def _ramp_weight(global_step: int, warmup_steps: int, ramp_steps: int, target: float) -> float:
-    if global_step < int(warmup_steps):
-        return 0.0
-    if int(ramp_steps) <= 0:
-        return float(target)
-    t = (global_step - int(warmup_steps)) / float(ramp_steps)
-    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-    return float(target) * float(t)
-
-def get_stage2_loss_weights(global_step: int):
-    lpips_w = _ramp_weight(global_step, LPIPS_WARMUP_STEPS, LPIPS_RAMP_STEPS, LPIPS_TARGET_WEIGHT)
-    gan_w = 0.0
-    if global_step >= GAN_WARMUP_STEPS:
-        gan_w = _ramp_weight(global_step, GAN_WARMUP_STEPS, GAN_RAMP_STEPS, GAN_TARGET_WEIGHT)
-    return lpips_w, gan_w
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None: return None
@@ -351,9 +249,9 @@ def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
     return counts
 
 def get_config_snapshot():
-    return {"batch_size": BATCH_SIZE, "v9_gan": True}
+    return {"batch_size": BATCH_SIZE, "lr_base": LR_BASE, "lora_rank": LORA_RANK, "v8_config": True}
 
-# ================= 5. Data Pipeline =================
+# ================= 4. Data Pipeline =================
 class DegradationPipeline:
     def __init__(self, crop_size=512):
         self.crop_size = crop_size
@@ -525,7 +423,7 @@ class DegradationPipeline:
         lr_out = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-        # STRICTLY 2 Values
+        # FIXED: Strictly return 2 values
         if return_meta:
             meta_out = {
                 "stage1_blur_applied": torch.tensor(int(stage1["blur_applied"]), dtype=torch.int64),
@@ -559,6 +457,7 @@ class DegradationPipeline:
             return lr_out, meta_out
         return lr_out
 
+# ================= 5. Datasets =================
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, is_train=True):
         self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
@@ -568,6 +467,7 @@ class DF2K_Online_Dataset(Dataset):
         self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         self.to_tensor = transforms.ToTensor()
         self.epoch = 0
+
     def set_epoch(self, epoch: int): self.epoch = int(epoch)
     def _make_generator(self, idx: int):
         gen = torch.Generator(); seed = SEED + (self.epoch * 1_000_000) + int(idx); gen.manual_seed(seed)
@@ -588,8 +488,12 @@ class DF2K_Online_Dataset(Dataset):
             else: hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         else: hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        # Ensure only 2 values unpacked
-        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
+        if self.is_train and TRAIN_DEG_MODE == "bicubic":
+            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
+            deg_meta = None
+        else: lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
         return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
@@ -632,8 +536,7 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
         else:
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
-            # Ensure only 2 values unpacked
-            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen) # Ignore meta here
+            lr_tensor = self.pipeline(hr_tensor, return_meta=False, meta=None, generator=gen)
         return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
 
 class ValPackDataset(Dataset):
@@ -700,7 +603,7 @@ def atomic_torch_save(state, path):
                 except Exception: pass
             return False, f"zip_error={e_zip}; legacy_error={e_old}"
 
-def save_smart(epoch, global_step, pixart, adapter, optimizer, optimizer_D, discriminator, ema_pixart, ema_adapter, best_records, metrics, dl_gen):
+def save_smart(epoch, global_step, pixart, adapter, optimizer, best_records, metrics, dl_gen):
     global BASE_PIXART_SHA256
     psnr_v, ssim_v, lpips_v = metrics; priority, score = should_keep_ckpt(psnr_v, lpips_v)
     current_record = {"path": None, "epoch": epoch, "priority": priority, "score": score, "psnr": psnr_v, "lpips": lpips_v}
@@ -729,23 +632,11 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, optimizer_D, disc
     pixart_sd = collect_trainable_state_dict(pixart); required_frags = get_required_v7_key_fragments_for_model(pixart)
     v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
     print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
-    
-    # [CRITICAL FIX] Save Discriminator, Optimizer_D, and EMA states
     state = {
-        "epoch": epoch, "step": global_step, 
-        "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
-        "optimizer_G": optimizer.state_dict(),
-        "optimizer_D": optimizer_D.state_dict(),
-        "discriminator": discriminator.state_dict(),
-        "ema_pixart": ema_pixart.state_dict(),
-        "ema_adapter": ema_adapter.state_dict(),
+        "epoch": epoch, "step": global_step, "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
+        "optimizer": optimizer.state_dict(),
         "rng_state": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "numpy": np.random.get_state(), "python": random.getstate()},
-        "dl_gen_state": dl_gen.get_state(), 
-        "pixart_trainable": pixart_sd, 
-        "best_records": best_records, 
-        "config_snapshot": get_config_snapshot(), 
-        "base_pixart_sha256": BASE_PIXART_SHA256, 
-        "env_info": {"torch": torch.__version__, "numpy": np.__version__},
+        "dl_gen_state": dl_gen.get_state(), "pixart_trainable": pixart_sd, "best_records": best_records, "config_snapshot": get_config_snapshot(), "base_pixart_sha256": BASE_PIXART_SHA256, "env_info": {"torch": torch.__version__, "numpy": np.__version__},
     }
     last_path = LAST_CKPT_PATH; ok_last, msg_last = atomic_torch_save(state, last_path)
     if ok_last: print(f"💾 Saved last checkpoint to {last_path} [{msg_last}]")
@@ -760,13 +651,7 @@ def save_smart(epoch, global_step, pixart, adapter, optimizer, optimizer_D, disc
         except Exception as e: print(f"❌ Failed to save best checkpoint: {e}")
     return best_records
 
-def optimizer_to_device(optimizer, device):
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
-
-def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen):
+def resume(pixart, adapter, optimizer, dl_gen):
     if not os.path.exists(LAST_CKPT_PATH): return 0, 0, []
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
@@ -786,45 +671,7 @@ def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart,
     for k, v in saved_trainable.items():
         if k in curr: curr[k] = v.to(curr[k].dtype)
     pixart.load_state_dict(curr, strict=False)
-    
-    # [CRITICAL FIX] Resume G, D, Opt_D, and EMA
-    if "optimizer" in ckpt: # Support legacy v8 checkpoints
-        optimizer_G.load_state_dict(ckpt["optimizer"])
-        print("⚠️ Loaded Optimizer G from legacy 'optimizer' key (v8 transition).")
-    elif "optimizer_G" in ckpt:
-        optimizer_G.load_state_dict(ckpt["optimizer_G"])
-        
-    if "optimizer_D" in ckpt:
-        optimizer_D.load_state_dict(ckpt["optimizer_D"])
-    else:
-        print("⚠️ Optimizer D not found in checkpoint. Starting D from scratch.")
-        
-    if "discriminator" in ckpt:
-        discriminator.load_state_dict(ckpt["discriminator"])
-    else:
-        print("⚠️ Discriminator state not found in checkpoint. Starting D from scratch.")
-
-    if "ema_pixart" in ckpt:
-        ema_pixart.load_state_dict(ckpt["ema_pixart"])
-    else:
-        print("⚠️ EMA PixArt not found. Force-syncing with loaded weights for v8->v9 transition.")
-        # [FIX] Manually update shadow params to match current loaded weights
-        # This prevents starting with random EMA weights when resuming from v8
-        ema_pixart.shadow_params = [p.clone().detach() for p in pixart.parameters()]
-
-    if "ema_adapter" in ckpt:
-        ema_adapter.load_state_dict(ckpt["ema_adapter"])
-    else:
-        print("⚠️ EMA Adapter not found. Force-syncing with loaded weights.")
-        ema_adapter.shadow_params = [p.clone().detach() for p in adapter.parameters()]
-
-    ema_to_device_(ema_pixart, DEVICE)
-    ema_to_device_(ema_adapter, DEVICE)    
-
-    # [FIX] Move optimizer states to GPU to prevent RuntimeError
-    optimizer_to_device(optimizer_G, DEVICE)
-    optimizer_to_device(optimizer_D, DEVICE)
-
+    optimizer.load_state_dict(ckpt["optimizer"])
     rs = ckpt.get("rng_state", None)
     if rs is not None:
         try:
@@ -839,13 +686,15 @@ def resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart,
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
-# ================= 8. Validation (Moved BEFORE Main) =================
+# ================= 8. Validation =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
     print(f"🔎 Validating Epoch {epoch+1}...")
     pixart.eval(); adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
+    
+    # [V8 Change] Validation uses V-Prediction scheduler
     scheduler = DDIMScheduler(
         num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
         clip_sample=False, prediction_type="v_prediction", set_alpha_to_one=False,
@@ -860,10 +709,13 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
             
+            # [V8 Change] Default USE_LQ_INIT=True helps anchoring early training
             if USE_LQ_INIT: latents, run_timesteps = get_lq_init_latents(z_lr.to(COMPUTE_DTYPE), scheduler, steps, val_gen, LQ_INIT_STRENGTH, COMPUTE_DTYPE)
             else: latents = randn_like_with_generator(z_hr, val_gen); run_timesteps = scheduler.timesteps
             
             cond = adapter(z_lr.float())
+            
+            # Validation uses 0 noise augmentation level
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
             for t in run_timesteps:
@@ -901,10 +753,9 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     pixart.train(); adapter.train()
     return results
 
-# ================= 10. Main =================
+# ================= 9. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
-    # [FIX] Dataset classes defined before main, so this works now.
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
     if VAL_MODE == "valpack": val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
     elif VAL_MODE == "train_like": val_ds = DF2K_Val_Degraded_Dataset(VAL_HR_DIR, crop_size=512, seed=SEED, deg_mode=TRAIN_DEG_MODE)
@@ -917,7 +768,6 @@ def main():
         input_size=64, in_channels=8, sparse_inject_ratio=SPARSE_INJECT_RATIO,
         injection_cutoff_layer=INJECTION_CUTOFF_LAYER, injection_strategy=INJECTION_STRATEGY,
     ).to(DEVICE)
-    # Re-init weights if starting fresh, or load checkpoint
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
@@ -927,16 +777,9 @@ def main():
         w8[:, :4] = w4; base["x_embedder.proj.weight"] = w8
     pixart.load_pretrained_weights_with_zero_init(base)
     apply_lora(pixart, LORA_RANK, LORA_ALPHA)
-    
+    pixart.train()
+
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layers", None)).to(DEVICE).float().train()
-    
-    # [EMA Setup]
-    ema_pixart = EMAModel(pixart.parameters(), decay=0.999)
-    ema_adapter = EMAModel(adapter.parameters(), decay=0.999)
-    
-    # [Discriminator Setup]
-    discriminator = NLayerDiscriminator(input_nc=3).to(DEVICE).train()
-    
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
     vae.enable_slicing()
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
@@ -947,31 +790,29 @@ def main():
     y = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE)
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # Optimizers
-    # [FIX] Group parameters properly like in v8 to match learning rates
+    # [FIXED HERE] Separate Optimizer Groups from Clipping List
     adapter_params = list(adapter.parameters())
-    embedder_params = [p for n, p in pixart.named_parameters() if 'x_embedder' in n and p.requires_grad]
-    other_pixart_params = [p for n, p in pixart.named_parameters() if 'x_embedder' not in n and p.requires_grad]
+    pixart_params = [p for p in pixart.parameters() if p.requires_grad]
+    lora_params = [p for n, p in pixart.named_parameters() if 'x_embedder' not in n and p.requires_grad]
     
-    g_params = [
-        {"params": adapter_params, "lr": LR_G_ADAPTER}, 
-        {"params": embedder_params, "lr": LR_G_ADAPTER}, # Keep input layer fast
-        {"params": other_pixart_params, "lr": LR_G_BASE}
+    # 1. Optimizer needs groups (dicts)
+    optim_groups = [
+        {"params": adapter_params, "lr": 1e-4}, 
+        {"params": pixart_params, "lr": 1e-5},
+        {"params": lora_params, "lr": 1e-5} 
     ]
-    optimizer_G = torch.optim.AdamW(g_params)
-    # [FIX] D Optimizer Standard Betas and Weight Decay
-    optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=LR_D, betas=(0.5, 0.999), weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(optim_groups) 
     
-    g_params_to_clip = adapter_params + embedder_params + other_pixart_params
+    # 2. Clipper needs flat tensor list
+    params_to_clip = adapter_params + embedder_params + lora_params
 
-    # [FIX] Initialize FFL Criterion
-    ffl_criterion = FocalFrequencyLoss(loss_weight=FFL_BASE_WEIGHT).to(DEVICE)
-
+    # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
+    # We will manually calculate v_target and loss.
+    # Note: IDDPM class is kept for schedule utils, but we bypass its loss function.
     diffusion = IDDPM(str(1000))
-    # [CRITICAL FIX] Pass all state objects to resume
-    ep_start, step, best = resume(pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, dl_gen)
+    ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
-    print("🚀 DiT-SR V9 Adversarial Training Started (InstanceNorm D, Correct Grad Flow, FFL, State Saving).")
+    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
 
     for epoch in range(ep_start, 1000):
@@ -985,159 +826,99 @@ def main():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
-            # --- Generator Step ---
+            # [V8 Logic] V-Prediction Training
             t = torch.randint(0, 1000, (zh.shape[0],), device=DEVICE).long()
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
+            # [V8 Logic] Conditioning Augmentation
+            # 1. Sample noise level for LR
             aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (COND_AUG_NOISE_RANGE[1] - COND_AUG_NOISE_RANGE[0]) + COND_AUG_NOISE_RANGE[0]
+            # 2. Add noise to LR
             zlr_aug = zl.float() + torch.randn_like(zl) * aug_noise_level[:, None, None, None]
+            # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = aug_noise_level * 1000.0
 
-            cond = adapter(zlr_aug.float())
+            cond = adapter(zlr_aug.float()) # Adapter sees augmented LR
             cond_in = cond
             if USE_ADAPTER_CFDROPOUT and COND_DROP_PROB > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= COND_DROP_PROB).float()
                 cond_in = mask_adapter_cond(cond, keep)
 
-            # Train Generator
-            
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
+                # Pass zlr_aug to concat as well (Consistency!)
                 kwargs = dict(x=torch.cat([zt, zlr_aug.to(zt.dtype)], dim=1), timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, injection_mode="hybrid")
                 kwargs["force_drop_ids"] = drop_uncond
+                
                 out = pixart(**kwargs)
                 if out.shape[1] == 8: out, _ = out.chunk(2, dim=1)
                 model_pred = out.float()
 
-                # [FIX] V-Prediction Min-SNR Weighting (Crucial for V-Pred)
+                # [V8 Logic] Calculate V-Target
+                # v = alpha * epsilon - sigma * x0
                 alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
                 sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
                 target_v = alpha_t * noise - sigma_t * zh.float()
                 
+                # [V8 Logic] Min-SNR-Gamma Weighting
+                # SNR = alpha^2 / sigma^2
                 snr = (alpha_t**2) / (sigma_t**2)
+                # Min-SNR-Gamma (gamma=5 is standard for V-pred)
                 gamma = 5.0
                 min_snr_gamma = torch.min(snr, torch.tensor(gamma, device=DEVICE))
-                loss_weights = min_snr_gamma / snr 
+                
+                # Loss = MSE(pred_v, target_v) * Min-SNR / SNR (simplified weighting often just min(snr, gamma) / snr_something, but standard implementation is simpler:
+                # For v-prediction, standard MSE is weighted by SNR/(SNR+1) effectively.
+                # Here we use simplified MSE on V directly, which is robust.
+                # Optional: Add Min-SNR weighting:
+                loss_weights = min_snr_gamma / snr # This balances the loss
                 loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1,2,3]) * loss_weights.squeeze()).mean()
-                
-                z0 = alpha_t * zt.float() - sigma_t * model_pred # Reconstruct z0
-                
+
+                # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
+                z0 = alpha_t * zt.float() - sigma_t * model_pred
+
                 loss_latent_l1 = F.l1_loss(z0, zh.float())
 
-                # Perceptual & GAN & FFL Loss (Pixel Space)
-                # Decode SMALL crop to save VRAM
-                top = torch.randint(0, 25, (1,), device=DEVICE).item() 
-                left = torch.randint(0, 25, (1,), device=DEVICE).item()
-                z0_crop = z0[..., top:top+40, left:left+40]
-                img_p_raw = vae.decode(z0_crop/vae.config.scaling_factor).sample.clamp(-1,1)
-                img_p_valid = img_p_raw[..., 32:-32, 32:-32] # 256x256 valid pixels
+                w = get_loss_weights(step)
                 
-                y0 = top * 8 + 32; x0 = left * 8 + 32
-                img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1) # Real HR patch
-                
-                with torch.cuda.amp.autocast(enabled=False):
-                        loss_lpips = lpips_fn(img_p_valid.float(), img_t_valid.float()).mean()
-                
-                loss_ffl = torch.tensor(0.0, device=DEVICE)
-                if FFL_BASE_WEIGHT > 0:
-                    loss_ffl = ffl_criterion(img_p_valid, img_t_valid)
+                if w['lpips'] > 0:
+                    top = torch.randint(0, 25, (1,), device=DEVICE).item() 
+                    left = torch.randint(0, 25, (1,), device=DEVICE).item()
+                    z0_crop = z0[..., top:top+40, left:left+40]
+                    img_p_raw = vae.decode(z0_crop/vae.config.scaling_factor).sample.clamp(-1,1)
+                    img_p_valid = img_p_raw[..., 32:-32, 32:-32]
+                    y0 = top * 8 + 32; x0 = left * 8 + 32
+                    img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
+                    loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+                else:
+                    loss_lpips = torch.tensor(0.0, device=DEVICE)
 
-                # GAN Loss (Generator side)
-                loss_gan = torch.tensor(0.0, device=DEVICE)
-                lpips_w, gan_w = get_stage2_loss_weights(step)
-
-                # [FIX] Only compute G's GAN loss if weight > 0
-                if gan_w > 0:
-                    set_requires_grad(discriminator, False)
-                    with torch.cuda.amp.autocast(enabled=False):
-                        pred_fake = discriminator(img_p_valid.float())
-                    loss_gan = -pred_fake.mean()
-
-                loss_G = (
+                loss = (
                     loss_v 
-                    + L1_BASE_WEIGHT * loss_latent_l1
-                    + lpips_w * loss_lpips
-                    + gan_w * loss_gan
-                    + loss_ffl # Add FFL
+                    + w['latent_l1']*loss_latent_l1
+                    + w['lpips']*loss_lpips
                 ) / GRAD_ACCUM_STEPS
 
-            loss_G.backward()
-
-            # --- Discriminator Step ---
-            loss_D_val = 0.0
-            if gan_w > 0:
-                img_p_detached = img_p_valid.detach()
-                img_t_valid_d = img_t_valid.detach()
-                set_requires_grad(discriminator, True)
-                
-                # [FIX] R1 Gradient Penalty for Stability
-                img_t_valid_d.requires_grad = True # For GP calculation
-                with torch.cuda.amp.autocast(enabled=False):
-                    pred_real = discriminator(img_t_valid_d.float())
-                    pred_fake_d = discriminator(img_p_detached.float())
-                    
-                    loss_D_real = torch.nn.ReLU()(1.0 - pred_real).mean()
-                    loss_D_fake = torch.nn.ReLU()(1.0 + pred_fake_d).mean()
-                    
-                    # R1 Penalty (Simplified implementation)
-                    # Computed every step for safety with BS=1
-                    r1_loss = 0.0
-                    if step % 16 == 0: # Compute R1 every 16 steps to save compute
-                        grad_real = torch.autograd.grad(
-                            outputs=pred_real.sum(), inputs=img_t_valid_d, create_graph=True
-                        )[0]
-                        r1_loss = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean() * 10.0 # Gamma=10
-                    
-                    loss_D = (loss_D_real + loss_D_fake + r1_loss) * 0.5 / GRAD_ACCUM_STEPS
-
-                loss_D.backward()
-                loss_D_val = loss_D.item() * GRAD_ACCUM_STEPS
-            else:
-                loss_D_val = 0.0
+            loss.backward()
 
             if (i+1) % GRAD_ACCUM_STEPS == 0:
-                torch.nn.utils.clip_grad_norm_(g_params_to_clip, 1.0)
-                optimizer_G.step()
-                optimizer_G.zero_grad()
-                
-                if gan_w > 0:
-                    optimizer_D.step()
-                    optimizer_D.zero_grad()
-                
-                # Update EMA
-                ema_pixart.step(pixart.parameters())
-                ema_adapter.step(adapter.parameters())
-                
+                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
                 step += 1
 
             if i % 10 == 0:
                 pbar.set_postfix({
-                    'v': f"{loss_v.item():.3f}",
-                    'l1': f"{loss_latent_l1.item():.3f}",
-                    'lp': f"{loss_lpips.item():.3f}",
-                    'ffl': f"{loss_ffl.item():.3f}",
-                    'gan': f"{loss_gan.item():.3f}",
-                    'd_loss': f"{loss_D_val:.3f}",
-                    'w_lp': f"{lpips_w:.3f}",
-                    'w_gan': f"{gan_w:.3f}",
+                    'v_loss': f"{loss_v:.3f}",
+                    'lat_l1': f"{loss_latent_l1:.3f}",
+                    'lp': f"{loss_lpips:.3f}",
                 })
 
-        # Validation uses EMA weights
-        ema_pixart.store(pixart.parameters())
-        ema_adapter.store(adapter.parameters())
-        ema_pixart.copy_to(pixart.parameters())
-        ema_adapter.copy_to(adapter.parameters())
-        
-        # [CRITICAL FIX] Pass correct optimizer_G to save_smart
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
-        
-        ema_pixart.restore(pixart.parameters())
-        ema_adapter.restore(adapter.parameters())
-        
         if int(BEST_VAL_STEPS) in val_dict: metrics = val_dict[int(BEST_VAL_STEPS)]
         else: metrics = next(iter(val_dict.values()))
-        best = save_smart(epoch, step, pixart, adapter, optimizer_G, optimizer_D, discriminator, ema_pixart, ema_adapter, best, metrics, dl_gen)
+        best = save_smart(epoch, step, pixart, adapter, optimizer, best, metrics, dl_gen)
 
 if __name__ == "__main__":
     main()

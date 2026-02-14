@@ -1,12 +1,12 @@
 # /home/hello/HJT/DiTSR/experiments/train_4090_auto_v8.py
-# DiTSR v8 Training Script
+# DiTSR v8 Training Script (Final Corrected Version)
 # ------------------------------------------------------------------
-# Major Refactoring based on "DiT-SR v8 Report":
-# 1. Prediction Type: Switched to "v_prediction" (Velocity) for high-SNR stability.
-# 2. Conditioning: SR3-style augmentation (Augment LR + Pass noise level embedding).
-# 3. Consistency: Same noisy LR condition passed to both Adapter and Concat branch.
-# 4. Initialization: Using Copy-Init in Model V8 to ensure signal visibility at Step 0.
-# 5. Validation: Default to LQ-Init (img2img style) to anchor early predictions.
+# Fixes included:
+# 1. [FFL] Added @torch.cuda.amp.autocast(enabled=False) & .float() cast.
+# 2. [Optim] Fixed parameter grouping (Mutually Exclusive).
+# 3. [Process] Unlocked x_embedder learning rate (1e-4).
+# 4. [Process] Disabled LPIPS for structure convergence (Stage 1).
+# 5. [Structure] Fixed NameError by ensuring Dataset classes are defined.
 # ------------------------------------------------------------------
 
 import os
@@ -101,29 +101,30 @@ SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 25
 INJECTION_STRATEGY = "front_dense"
 
-# [V8 Augmentation] Range of noise added to LR condition (SR3 style)
-# This is physically added to the LR Latent.
+# [V8 Augmentation]
 COND_AUG_NOISE_RANGE = (0.0, 0.15) 
 
-WARMUP_STEPS = 3500          
+WARMUP_STEPS = 4500         
 RAMP_UP_STEPS = 5000         
 TARGET_LPIPS_WEIGHT = 0.50
 LPIPS_BASE_WEIGHT = 0.0      
 L1_BASE_WEIGHT = 1.0
+# [New] Focal Frequency Loss Weight
+FFL_BASE_WEIGHT = 0.1
 
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
-PSNR_SWITCH = 23.0
-KEEP_TOPK = 1
+PSNR_SWITCH = 24.0
+KEEP_TOPK = 2
 VAL_MODE = "valpack"
 VAL_PACK_DIR = os.path.join(PROJECT_ROOT, "valpacks", "df2k_train_like_50_seed3407")
 VAL_PACK_LR_DIR_NAME = "lq512"
 TRAIN_DEG_MODE = "highorder"
 CFG_SCALE = 3.0
 
-# [V8 Change] Default to LQ-Init for validation to see anchor immediately
+# [V8 Change] Default to LQ-Init for validation
 USE_LQ_INIT = True 
-LQ_INIT_STRENGTH = 0.1 # Start very close to LR
+LQ_INIT_STRENGTH = 0.1
 
 INIT_NOISE_STD = 0.0
 USE_CFG_TRAIN = False
@@ -133,7 +134,7 @@ COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True
 
 USE_LR_CONSISTENCY = False 
-USE_NOISE_CONSISTENCY = False # V-pred makes this tricky, disabled for V8 stability
+USE_NOISE_CONSISTENCY = False
 
 VAE_TILING = False
 DEG_OPS = ["blur", "resize", "noise", "jpeg"]
@@ -180,11 +181,10 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     start_index = min(max(start_index, 0), len(timesteps) - 1)
     t_start = timesteps[start_index]
     noise = randn_like_with_generator(z_lr, generator)
-    # V-Prediction / Img2Img Logic
     if hasattr(scheduler, "add_noise"):
         latents = scheduler.add_noise(z_lr, noise, t_start)
     else:
-        latents = z_lr + noise # Fallback
+        latents = z_lr + noise 
     return latents.to(dtype=dtype), timesteps[start_index:]
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
@@ -245,11 +245,50 @@ def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
         c = sum(1 for k in keys if frag in k)
         counts[frag] = c
         if c == 0: missing.append(frag)
-    if missing: raise RuntimeError("Trainable checkpoint validation failed: " + ", ".join(missing))
+    if missing:
+        raise RuntimeError("v7 trainable checkpoint validation failed: " + ", ".join(missing))
     return counts
 
 def get_config_snapshot():
-    return {"batch_size": BATCH_SIZE, "lr_base": LR_BASE, "lora_rank": LORA_RANK, "v8_config": True}
+    return {
+        "batch_size": BATCH_SIZE,
+        "lr_base": LR_BASE,
+        "lora_rank": LORA_RANK,
+        "sparse_inject_ratio": SPARSE_INJECT_RATIO,
+        "lr_latent_noise_std": INIT_NOISE_STD,
+        "ffl_weight": FFL_BASE_WEIGHT,
+        "loss_weights": "Dynamic",
+        "seed": SEED,
+    }
+
+# [New Class] Focal Frequency Loss (Placed BEFORE Main)
+class FocalFrequencyLoss(nn.Module):
+    def __init__(self, loss_weight=1.0, alpha=1.0):
+        super(FocalFrequencyLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.alpha = alpha
+
+    # [FIX] Enforce FP32 execution to avoid BFloat16 error in FFT
+    @torch.cuda.amp.autocast(enabled=False)
+    def forward(self, pred, target):
+        # Cast to float32 explicitly
+        pred = pred.float()
+        target = target.float()
+
+        # pred, target: [B, C, H, W]
+        # Calculate 2D FFT
+        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
+        target_fft = torch.fft.fft2(target, dim=(-2, -1))
+        
+        # Stack real and imag parts
+        pred_fft = torch.stack([pred_fft.real, pred_fft.imag], -1)
+        target_fft = torch.stack([target_fft.real, target_fft.imag], -1)
+
+        # MSE in Frequency Domain
+        diff = pred_fft - target_fft
+        loss = torch.mean(diff ** 2) 
+
+        return loss * self.loss_weight
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -457,7 +496,7 @@ class DegradationPipeline:
             return lr_out, meta_out
         return lr_out
 
-# ================= 5. Datasets =================
+# ================= 6. Datasets (Correctly Placed BEFORE Main) =================
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, is_train=True):
         self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
@@ -488,12 +527,8 @@ class DF2K_Online_Dataset(Dataset):
             else: hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         else: hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        if self.is_train and TRAIN_DEG_MODE == "bicubic":
-            lr_small = TF.resize((hr_tensor + 1.0) * 0.5, (self.crop_size // 4, self.crop_size // 4), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = TF.resize(lr_small, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-            lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
-            deg_meta = None
-        else: lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
+        # Ensure only 2 values unpacked
+        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
         return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
@@ -536,7 +571,8 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             lr_tensor = (lr_tensor * 2.0 - 1.0).clamp(-1.0, 1.0)
         else:
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
-            lr_tensor = self.pipeline(hr_tensor, return_meta=False, meta=None, generator=gen)
+            # Ensure only 2 values unpacked
+            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen) # Ignore meta here
         return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
 
 class ValPackDataset(Dataset):
@@ -557,7 +593,7 @@ class ValPackDataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
         return {"hr": hr_tensor, "lr": lr_tensor, "path": str(hr_path)}
 
-# ================= 6. LoRA =================
+# ================= 7. LoRA =================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int, alpha: float):
         super().__init__()
@@ -581,7 +617,7 @@ def apply_lora(model, rank=64, alpha=64):
              setattr(parent, child, LoRALinear(module, rank, alpha)); cnt += 1
     print(f"✅ LoRA applied to {cnt} layers.")
 
-# ================= 7. Checkpointing =================
+# ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     if not math.isfinite(psnr_v): return (999, float("inf"))
     if psnr_v >= PSNR_SWITCH and math.isfinite(lpips_v): return (0, lpips_v)
@@ -686,7 +722,7 @@ def resume(pixart, adapter, optimizer, dl_gen):
         except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", [])
 
-# ================= 8. Validation =================
+# ================= 9. Validation =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn):
     print(f"🔎 Validating Epoch {epoch+1}...")
@@ -753,7 +789,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
     pixart.train(); adapter.train()
     return results
 
-# ================= 9. Main =================
+# ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
     train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
@@ -790,19 +826,34 @@ def main():
     y = torch.load(T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(DEVICE)
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
-    # [FIXED HERE] Separate Optimizer Groups from Clipping List
+    # [FIXED HERE] Process-Corrected Optimizer Grouping (Mutually Exclusive)
     adapter_params = list(adapter.parameters())
-    pixart_params = [p for p in pixart.parameters() if p.requires_grad]
     
-    # 1. Optimizer needs groups (dicts)
+    # 1. Select params for 'Fast Lane' (x_embedder)
+    embedder_params = []
+    # 2. Select params for 'Slow Lane' (Backbone/LoRA)
+    other_pixart_params = []
+
+    for n, p in pixart.named_parameters():
+        if p.requires_grad:
+            if 'x_embedder' in n:
+                embedder_params.append(p)
+            else:
+                other_pixart_params.append(p)
+    
+    # 3. Create Optimizer Groups
     optim_groups = [
         {"params": adapter_params, "lr": 1e-4}, 
-        {"params": pixart_params, "lr": 1e-5}
+        {"params": embedder_params, "lr": 1e-4}, # Input Layer unlocked
+        {"params": other_pixart_params, "lr": 1e-5} 
     ]
     optimizer = torch.optim.AdamW(optim_groups) 
     
     # 2. Clipper needs flat tensor list
-    params_to_clip = adapter_params + pixart_params
+    params_to_clip = adapter_params + embedder_params + other_pixart_params
+
+    # [New] Initialize Focal Frequency Loss
+    ffl_criterion = FocalFrequencyLoss(loss_weight=FFL_BASE_WEIGHT).to(DEVICE)
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
     # We will manually calculate v_target and loss.
@@ -810,7 +861,7 @@ def main():
     diffusion = IDDPM(str(1000))
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
-    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
+    print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init, FFL).")
     max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
 
     for epoch in range(ep_start, 1000):
@@ -880,7 +931,12 @@ def main():
 
                 w = get_loss_weights(step)
                 
-                if w['lpips'] > 0:
+                # Calculate pixel-space losses (FFL and/or LPIPS)
+                # We decode if either LPIPS or FFL is active to save resources
+                loss_ffl = torch.tensor(0.0, device=DEVICE)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
+
+                if w['lpips'] > 0 or FFL_BASE_WEIGHT > 0:
                     top = torch.randint(0, 25, (1,), device=DEVICE).item() 
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_crop = z0[..., top:top+40, left:left+40]
@@ -888,14 +944,19 @@ def main():
                     img_p_valid = img_p_raw[..., 32:-32, 32:-32]
                     y0 = top * 8 + 32; x0 = left * 8 + 32
                     img_t_valid = hr[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                    loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
-                else:
-                    loss_lpips = torch.tensor(0.0, device=DEVICE)
+                    
+                    if w['lpips'] > 0:
+                        loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+                    
+                    # [New] Compute FFL (with float32 cast fix)
+                    if FFL_BASE_WEIGHT > 0:
+                        loss_ffl = ffl_criterion(img_p_valid, img_t_valid)
 
                 loss = (
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
                     + w['lpips']*loss_lpips
+                    + loss_ffl 
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
@@ -911,6 +972,7 @@ def main():
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'lp': f"{loss_lpips:.3f}",
+                    'ffl': f"{loss_ffl.item():.4f}",
                 })
 
         val_dict = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn)
