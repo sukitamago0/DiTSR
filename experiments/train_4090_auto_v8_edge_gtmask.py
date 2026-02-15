@@ -64,7 +64,12 @@ def get_required_v7_key_fragments_for_model(model: nn.Module):
     return tuple(required)
 
 # ================= 2. Hyper-parameters =================
-TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
+TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
+TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
+TRAIN_REALSR_DIRS = [
+    "/data/RealSR/Canon/Train/4",
+    "/data/RealSR/Nikon/Train/4",
+]
 VAL_HR_DIR   = "/data/DF2K/DF2K_valid_HR"
 VAL_LR_DIR   = "/data/DF2K/DF2K_valid_LR_bicubic/X4"
 if not os.path.exists(VAL_LR_DIR): VAL_LR_DIR = None
@@ -565,12 +570,75 @@ class DegradationPipeline:
         return lr_out
 
 # ================= 6. Datasets (Correctly Placed BEFORE Main) =================
+def _scan_images(root):
+    root_p = Path(root)
+    if not root_p.exists():
+        return []
+    out = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+        out.extend(root_p.rglob(ext))
+    return sorted(out)
+
+def _normalize_pair_stem(stem: str) -> str:
+    key = stem.lower()
+    for tok in ("_hr", "_lr4", "_lr", "x4"):
+        key = key.replace(tok, "")
+    return key
+
+def build_paired_file_list(df2k_hr_root: str, df2k_lr_root: str, realsr_roots):
+    pairs = []
+    df2k_hr = _scan_images(df2k_hr_root)
+    if df2k_hr and os.path.exists(df2k_lr_root):
+        lr_map = {}
+        for p in _scan_images(df2k_lr_root):
+            lr_map.setdefault(_normalize_pair_stem(p.stem), []).append(str(p))
+        for hr_path in df2k_hr:
+            key = _normalize_pair_stem(hr_path.stem)
+            lr_cands = lr_map.get(key, [])
+            if not lr_cands:
+                continue
+            best_lr = sorted(lr_cands, key=lambda x: ("lr4" not in x.lower() and "x4" not in x.lower(), len(x)))[0]
+            pairs.append((best_lr, str(hr_path)))
+
+    for root in realsr_roots:
+        for hr_path in _scan_images(root):
+            stem = hr_path.stem
+            if "_hr" not in stem.lower():
+                continue
+            lr_name = stem.replace("_HR", "_LR4").replace("_hr", "_lr4") + hr_path.suffix
+            lr_path = hr_path.with_name(lr_name)
+            if lr_path.exists():
+                pairs.append((str(lr_path), str(hr_path)))
+    return sorted(pairs)
+
+def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: int = 4):
+    wl, hl = lr_pil.size
+    wh, hh = hr_pil.size
+    h2 = min(hh, hl * scale)
+    w2 = min(wh, wl * scale)
+    h2 = (h2 // scale) * scale
+    w2 = (w2 // scale) * scale
+    if h2 <= 0 or w2 <= 0:
+        raise ValueError(f"Invalid aligned size with LR={lr_pil.size}, HR={hr_pil.size}")
+    hr_top = (hh - h2) // 2
+    hr_left = (wh - w2) // 2
+    lr_h2 = h2 // scale
+    lr_w2 = w2 // scale
+    lr_top = (hl - lr_h2) // 2
+    lr_left = (wl - lr_w2) // 2
+    hr_aligned = TF.crop(hr_pil, hr_top, hr_left, h2, w2)
+    lr_aligned = TF.crop(lr_pil, lr_top, lr_left, lr_h2, lr_w2)
+    return lr_aligned, hr_aligned
+
 class DF2K_Online_Dataset(Dataset):
-    def __init__(self, hr_root, crop_size=512, is_train=True):
-        self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
+    def __init__(self, crop_size=512, is_train=True, scale=4):
+        self.pairs = build_paired_file_list(TRAIN_DF2K_HR_DIR, TRAIN_DF2K_LR_DIR, TRAIN_REALSR_DIRS)
+        if len(self.pairs) == 0:
+            raise RuntimeError("No LR/HR pairs found from DF2K/RealSR training roots.")
         self.crop_size = crop_size
+        self.lr_patch = crop_size // scale
+        self.scale = scale
         self.is_train = is_train
-        self.pipeline = DegradationPipeline(crop_size)
         self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         self.to_tensor = transforms.ToTensor()
         self.epoch = 0
@@ -579,25 +647,47 @@ class DF2K_Online_Dataset(Dataset):
     def _make_generator(self, idx: int):
         gen = torch.Generator(); seed = SEED + (self.epoch * 1_000_000) + int(idx); gen.manual_seed(seed)
         return gen
-    def __len__(self): return len(self.hr_paths)
+    def __len__(self): return len(self.pairs)
     def __getitem__(self, idx):
-        try: hr_pil = Image.open(self.hr_paths[idx]).convert("RGB")
+        try:
+            lr_path, hr_path = self.pairs[idx]
+            lr_pil = Image.open(lr_path).convert("RGB")
+            hr_pil = Image.open(hr_path).convert("RGB")
         except: return self.__getitem__((idx + 1) % len(self))
         gen = None
+        lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+
         if self.is_train:
             gen = self._make_generator(idx)
-            if hr_pil.width >= self.crop_size and hr_pil.height >= self.crop_size:
-                max_top = hr_pil.height - self.crop_size + 1
-                max_left = hr_pil.width - self.crop_size + 1
-                top = int(torch.randint(0, max_top, (1,), generator=gen).item())
-                left = int(torch.randint(0, max_left, (1,), generator=gen).item())
-                hr_crop = TF.crop(hr_pil, top, left, self.crop_size, self.crop_size)
-            else: hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        else: hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
+            w_l, h_l = lr_aligned.size
+            if h_l < self.lr_patch or w_l < self.lr_patch:
+                lr_aligned = TF.resize(lr_aligned, (self.lr_patch, self.lr_patch), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                hr_aligned = TF.resize(hr_aligned, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                x = 0
+                y = 0
+            else:
+                max_x = w_l - self.lr_patch
+                max_y = h_l - self.lr_patch
+                x = int(torch.randint(0, max_x + 1, (1,), generator=gen).item())
+                y = int(torch.randint(0, max_y + 1, (1,), generator=gen).item())
+            lr_crop = TF.crop(lr_aligned, y, x, self.lr_patch, self.lr_patch)
+            hr_crop = TF.crop(hr_aligned, y * self.scale, x * self.scale, self.crop_size, self.crop_size)
+            if torch.rand(1, generator=gen).item() < 0.5:
+                lr_crop = TF.hflip(lr_crop)
+                hr_crop = TF.hflip(hr_crop)
+            k = int(torch.randint(0, 4, (1,), generator=gen).item())
+            if k:
+                angle = 90 * k
+                lr_crop = TF.rotate(lr_crop, angle)
+                hr_crop = TF.rotate(hr_crop, angle)
+        else:
+            lr_crop = TF.center_crop(lr_aligned, (self.lr_patch, self.lr_patch))
+            hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+
+        lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        # Ensure only 2 values unpacked
-        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
-        return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
+        lr_tensor = self.norm(self.to_tensor(lr_up))
+        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
     def __init__(self, hr_root, lr_root=None, crop_size=512):
@@ -607,16 +697,18 @@ class DF2K_Val_Fixed_Dataset(Dataset):
     def __len__(self): return len(self.hr_paths)
     def __getitem__(self, idx):
         hr_path = self.hr_paths[idx]; hr_pil = Image.open(hr_path).convert("RGB")
-        hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         lr_crop = None
         if self.lr_root:
             base = os.path.basename(hr_path); lr_name = base.replace(".png", "x4.png")
             lr_p = os.path.join(self.lr_root, lr_name)
             if os.path.exists(lr_p):
                 lr_pil = Image.open(lr_p).convert("RGB")
-                lr_crop = TF.center_crop(lr_pil, (self.crop_size//4, self.crop_size//4))
+                lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=4)
+                lr_crop = TF.center_crop(lr_aligned, (self.crop_size//4, self.crop_size//4))
+                hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
                 lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         if lr_crop is None:
+            hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
             w, h = hr_crop.size; lr_small = hr_crop.resize((w//4, h//4), Image.BICUBIC)
             lr_crop = lr_small.resize((w, h), Image.BICUBIC)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
@@ -860,7 +952,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 # ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
-    train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
+    train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
     if VAL_MODE == "valpack": val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
     elif VAL_MODE == "train_like": val_ds = DF2K_Val_Degraded_Dataset(VAL_HR_DIR, crop_size=512, seed=SEED, deg_mode=TRAIN_DEG_MODE)
     elif VAL_MODE == "lr_dir" and VAL_LR_DIR is not None: val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=VAL_LR_DIR, crop_size=512)
