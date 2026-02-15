@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Grid-search inference knobs on RealSR evaluator.
 
-Runs eval_ditsr_realsr_pairs.py multiple times and ranks by PSNR-Y (then LPIPS).
+Design goals:
+- Reuse evaluator behavior (which itself reuses training-script logic where possible).
+- Be robust across evaluator CLI variants in this repo history.
+- Avoid crashing on argument drift; degrade gracefully and print capability warnings.
 """
 
 import argparse
@@ -22,6 +25,10 @@ def detect_eval_cli_support(eval_script: str):
         "use_lq_init": "--use-lq-init" in out,
         "no_lq_init": "--no-lq-init" in out,
         "lq_init_strength": "--lq-init-strength" in out,
+        "crop_size": "--crop-size" in out,
+        "eval_size": "--eval-size" in out,
+        "save_panels_dir": "--save-panels-dir" in out,
+        "save_preds_dir": "--save-preds-dir" in out,
     }
 
 
@@ -64,7 +71,8 @@ def main():
     ap.add_argument("--save-max-per-dataset", type=int, default=0, help="Set 0 to skip saving previews in sweep")
     ap.add_argument("--use-ema", action="store_true")
     ap.add_argument("--cfg-list", default="1.0,2.0,3.0")
-    ap.add_argument("--init-list", default="off,0.0,0.05,0.1")
+    # IMPORTANT: in current training logic, larger strength -> closer to LR input (more conservative).
+    ap.add_argument("--init-list", default="off,0.7,0.85,0.95")
     ap.add_argument("--out-dir", default="experiments_results/realsr_eval_sweep")
     args = ap.parse_args()
 
@@ -79,21 +87,33 @@ def main():
         else:
             inits.append((True, float(t)))
 
+    eval_script = "experiments/eval_ditsr_realsr_pairs.py"
+    cli_support = detect_eval_cli_support(eval_script)
+    print(f"CLI support detected: {cli_support}")
+
     base_cmd = [
-        "python", "experiments/eval_ditsr_realsr_pairs.py",
+        "python", eval_script,
         "--train-script", args.train_script,
         "--ckpt", args.ckpt,
         "--steps", str(args.steps),
-        "--crop-size", str(args.crop_size),
         "--crop-border", str(args.crop_border),
         "--save-max-per-dataset", str(args.save_max_per_dataset),
-        "--save-panels-dir", str(out_dir / "panels"),
     ]
+    if cli_support["crop_size"]:
+        base_cmd += ["--crop-size", str(args.crop_size)]
+    elif cli_support["eval_size"]:
+        base_cmd += ["--eval-size", str(args.crop_size)]
+
+    if cli_support["save_panels_dir"]:
+        base_cmd += ["--save-panels-dir", str(out_dir / "panels")]
+    elif cli_support["save_preds_dir"]:
+        base_cmd += ["--save-preds-dir", str(out_dir / "preds")]
+
     if args.use_ema:
         base_cmd.append("--use-ema")
 
-    cli_support = detect_eval_cli_support("experiments/eval_ditsr_realsr_pairs.py")
-    print(f"CLI support detected: {cli_support}")
+    if not (cli_support["use_lq_init"] and cli_support["no_lq_init"] and cli_support["lq_init_strength"]):
+        print("⚠️ Evaluator does not fully expose LQ-init CLI knobs; sweep will effectively focus on cfg.")
 
     rows = []
     for i, (cfg, (use_lq_init, lq_init_strength)) in enumerate(itertools.product(cfgs, inits)):
