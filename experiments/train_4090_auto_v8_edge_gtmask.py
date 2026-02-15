@@ -64,7 +64,12 @@ def get_required_v7_key_fragments_for_model(model: nn.Module):
     return tuple(required)
 
 # ================= 2. Hyper-parameters =================
-TRAIN_HR_DIR = "/data/DF2K/DF2K_train_HR"
+TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
+TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
+TRAIN_REALSR_DIRS = [
+    "/data/RealSR/Canon/Train/4",
+    "/data/RealSR/Nikon/Train/4",
+]
 VAL_HR_DIR   = "/data/DF2K/DF2K_valid_HR"
 VAL_LR_DIR   = "/data/DF2K/DF2K_valid_LR_bicubic/X4"
 if not os.path.exists(VAL_LR_DIR): VAL_LR_DIR = None
@@ -90,6 +95,7 @@ FAST_DEV_RUN = os.getenv("FAST_DEV_RUN", "0") == "1"
 FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
 FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
 FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
+MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "0"))
 
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
@@ -116,6 +122,8 @@ EDGE_GRAD_WEIGHT = 0.10     # edge-region gradient matching
 FLAT_HF_WEIGHT   = 0.05     # flat/defocus HF suppression (Laplacian)
 EDGE_Q           = 0.90     # GT edge quantile for normalization
 EDGE_POW         = 0.50     # mask sharpening ( <1 boosts weak edges )
+EDGE_WARMUP_STEPS = 3000
+EDGE_RAMP_STEPS = 4000
 
 VAL_STEPS_LIST = [50]
 BEST_VAL_STEPS = 50
@@ -160,6 +168,15 @@ def get_loss_weights(global_step):
         weights['lpips'] = LPIPS_BASE_WEIGHT + (TARGET_LPIPS_WEIGHT - LPIPS_BASE_WEIGHT) * progress
     else:
         weights['lpips'] = TARGET_LPIPS_WEIGHT
+
+    if global_step < EDGE_WARMUP_STEPS:
+        edge_progress = 0.0
+    elif EDGE_RAMP_STEPS <= 0:
+        edge_progress = 1.0
+    else:
+        edge_progress = min(1.0, (global_step - EDGE_WARMUP_STEPS) / EDGE_RAMP_STEPS)
+    weights['edge_grad'] = EDGE_GRAD_WEIGHT * edge_progress
+    weights['flat_hf'] = FLAT_HF_WEIGHT * edge_progress
     return weights
 
 def rgb01_to_y01(rgb01):
@@ -553,12 +570,75 @@ class DegradationPipeline:
         return lr_out
 
 # ================= 6. Datasets (Correctly Placed BEFORE Main) =================
+def _scan_images(root):
+    root_p = Path(root)
+    if not root_p.exists():
+        return []
+    out = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+        out.extend(root_p.rglob(ext))
+    return sorted(out)
+
+def _normalize_pair_stem(stem: str) -> str:
+    key = stem.lower()
+    for tok in ("_hr", "_lr4", "_lr", "x4"):
+        key = key.replace(tok, "")
+    return key
+
+def build_paired_file_list(df2k_hr_root: str, df2k_lr_root: str, realsr_roots):
+    pairs = []
+    df2k_hr = _scan_images(df2k_hr_root)
+    if df2k_hr and os.path.exists(df2k_lr_root):
+        lr_map = {}
+        for p in _scan_images(df2k_lr_root):
+            lr_map.setdefault(_normalize_pair_stem(p.stem), []).append(str(p))
+        for hr_path in df2k_hr:
+            key = _normalize_pair_stem(hr_path.stem)
+            lr_cands = lr_map.get(key, [])
+            if not lr_cands:
+                continue
+            best_lr = sorted(lr_cands, key=lambda x: ("lr4" not in x.lower() and "x4" not in x.lower(), len(x)))[0]
+            pairs.append((best_lr, str(hr_path)))
+
+    for root in realsr_roots:
+        for hr_path in _scan_images(root):
+            stem = hr_path.stem
+            if "_hr" not in stem.lower():
+                continue
+            lr_name = stem.replace("_HR", "_LR4").replace("_hr", "_lr4") + hr_path.suffix
+            lr_path = hr_path.with_name(lr_name)
+            if lr_path.exists():
+                pairs.append((str(lr_path), str(hr_path)))
+    return sorted(pairs)
+
+def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: int = 4):
+    wl, hl = lr_pil.size
+    wh, hh = hr_pil.size
+    h2 = min(hh, hl * scale)
+    w2 = min(wh, wl * scale)
+    h2 = (h2 // scale) * scale
+    w2 = (w2 // scale) * scale
+    if h2 <= 0 or w2 <= 0:
+        raise ValueError(f"Invalid aligned size with LR={lr_pil.size}, HR={hr_pil.size}")
+    hr_top = (hh - h2) // 2
+    hr_left = (wh - w2) // 2
+    lr_h2 = h2 // scale
+    lr_w2 = w2 // scale
+    lr_top = (hl - lr_h2) // 2
+    lr_left = (wl - lr_w2) // 2
+    hr_aligned = TF.crop(hr_pil, hr_top, hr_left, h2, w2)
+    lr_aligned = TF.crop(lr_pil, lr_top, lr_left, lr_h2, lr_w2)
+    return lr_aligned, hr_aligned
+
 class DF2K_Online_Dataset(Dataset):
-    def __init__(self, hr_root, crop_size=512, is_train=True):
-        self.hr_paths = sorted(glob.glob(os.path.join(hr_root, "*.png")))
+    def __init__(self, crop_size=512, is_train=True, scale=4):
+        self.pairs = build_paired_file_list(TRAIN_DF2K_HR_DIR, TRAIN_DF2K_LR_DIR, TRAIN_REALSR_DIRS)
+        if len(self.pairs) == 0:
+            raise RuntimeError("No LR/HR pairs found from DF2K/RealSR training roots.")
         self.crop_size = crop_size
+        self.lr_patch = crop_size // scale
+        self.scale = scale
         self.is_train = is_train
-        self.pipeline = DegradationPipeline(crop_size)
         self.norm = transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         self.to_tensor = transforms.ToTensor()
         self.epoch = 0
@@ -567,25 +647,47 @@ class DF2K_Online_Dataset(Dataset):
     def _make_generator(self, idx: int):
         gen = torch.Generator(); seed = SEED + (self.epoch * 1_000_000) + int(idx); gen.manual_seed(seed)
         return gen
-    def __len__(self): return len(self.hr_paths)
+    def __len__(self): return len(self.pairs)
     def __getitem__(self, idx):
-        try: hr_pil = Image.open(self.hr_paths[idx]).convert("RGB")
+        try:
+            lr_path, hr_path = self.pairs[idx]
+            lr_pil = Image.open(lr_path).convert("RGB")
+            hr_pil = Image.open(hr_path).convert("RGB")
         except: return self.__getitem__((idx + 1) % len(self))
         gen = None
+        lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+
         if self.is_train:
             gen = self._make_generator(idx)
-            if hr_pil.width >= self.crop_size and hr_pil.height >= self.crop_size:
-                max_top = hr_pil.height - self.crop_size + 1
-                max_left = hr_pil.width - self.crop_size + 1
-                top = int(torch.randint(0, max_top, (1,), generator=gen).item())
-                left = int(torch.randint(0, max_left, (1,), generator=gen).item())
-                hr_crop = TF.crop(hr_pil, top, left, self.crop_size, self.crop_size)
-            else: hr_crop = TF.resize(hr_pil, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        else: hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
+            w_l, h_l = lr_aligned.size
+            if h_l < self.lr_patch or w_l < self.lr_patch:
+                lr_aligned = TF.resize(lr_aligned, (self.lr_patch, self.lr_patch), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                hr_aligned = TF.resize(hr_aligned, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                x = 0
+                y = 0
+            else:
+                max_x = w_l - self.lr_patch
+                max_y = h_l - self.lr_patch
+                x = int(torch.randint(0, max_x + 1, (1,), generator=gen).item())
+                y = int(torch.randint(0, max_y + 1, (1,), generator=gen).item())
+            lr_crop = TF.crop(lr_aligned, y, x, self.lr_patch, self.lr_patch)
+            hr_crop = TF.crop(hr_aligned, y * self.scale, x * self.scale, self.crop_size, self.crop_size)
+            if torch.rand(1, generator=gen).item() < 0.5:
+                lr_crop = TF.hflip(lr_crop)
+                hr_crop = TF.hflip(hr_crop)
+            k = int(torch.randint(0, 4, (1,), generator=gen).item())
+            if k:
+                angle = 90 * k
+                lr_crop = TF.rotate(lr_crop, angle)
+                hr_crop = TF.rotate(hr_crop, angle)
+        else:
+            lr_crop = TF.center_crop(lr_aligned, (self.lr_patch, self.lr_patch))
+            hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+
+        lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop))
-        # Ensure only 2 values unpacked
-        lr_tensor, deg_meta = self.pipeline(hr_tensor, return_meta=True, generator=gen if self.is_train else None)
-        return {"hr": hr_tensor, "lr": lr_tensor, "deg": deg_meta}
+        lr_tensor = self.norm(self.to_tensor(lr_up))
+        return {"hr": hr_tensor, "lr": lr_tensor, "path": hr_path}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
     def __init__(self, hr_root, lr_root=None, crop_size=512):
@@ -595,16 +697,18 @@ class DF2K_Val_Fixed_Dataset(Dataset):
     def __len__(self): return len(self.hr_paths)
     def __getitem__(self, idx):
         hr_path = self.hr_paths[idx]; hr_pil = Image.open(hr_path).convert("RGB")
-        hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
         lr_crop = None
         if self.lr_root:
             base = os.path.basename(hr_path); lr_name = base.replace(".png", "x4.png")
             lr_p = os.path.join(self.lr_root, lr_name)
             if os.path.exists(lr_p):
                 lr_pil = Image.open(lr_p).convert("RGB")
-                lr_crop = TF.center_crop(lr_pil, (self.crop_size//4, self.crop_size//4))
+                lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=4)
+                lr_crop = TF.center_crop(lr_aligned, (self.crop_size//4, self.crop_size//4))
+                hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
                 lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         if lr_crop is None:
+            hr_crop = TF.center_crop(hr_pil, (self.crop_size, self.crop_size))
             w, h = hr_crop.size; lr_small = hr_crop.resize((w//4, h//4), Image.BICUBIC)
             lr_crop = lr_small.resize((w, h), Image.BICUBIC)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
@@ -848,7 +952,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 # ================= 10. Main =================
 def main():
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
-    train_ds = DF2K_Online_Dataset(TRAIN_HR_DIR, crop_size=512, is_train=True)
+    train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
     if VAL_MODE == "valpack": val_ds = ValPackDataset(VAL_PACK_DIR, lr_dir_name=VAL_PACK_LR_DIR_NAME, crop_size=512)
     elif VAL_MODE == "train_like": val_ds = DF2K_Val_Degraded_Dataset(VAL_HR_DIR, crop_size=512, seed=SEED, deg_mode=TRAIN_DEG_MODE)
     elif VAL_MODE == "lr_dir" and VAL_LR_DIR is not None: val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=VAL_LR_DIR, crop_size=512)
@@ -917,7 +1021,7 @@ def main():
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init, FFL).")
-    max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
+    max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
 
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps: break
@@ -991,8 +1095,9 @@ def main():
                 loss_edge = torch.tensor(0.0, device=DEVICE)
                 loss_flat_hf = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                loss_ffl = torch.tensor(0.0, device=DEVICE)
 
-                if w['lpips'] > 0 or (EDGE_GRAD_WEIGHT > 0 or FLAT_HF_WEIGHT > 0):
+                if w['lpips'] > 0 or (w['edge_grad'] > 0 or w['flat_hf'] > 0):
                     top = torch.randint(0, 25, (1,), device=DEVICE).item() 
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_crop = z0[..., top:top+40, left:left+40]
@@ -1003,6 +1108,11 @@ def main():
                     
                     if w['lpips'] > 0:
                         loss_lpips = lpips_fn(img_p_valid, img_t_valid).mean()
+
+                    if w['edge_grad'] > 0 or w['flat_hf'] > 0:
+                        loss_edge, loss_flat_hf, _ = edge_guided_losses(
+                            img_p_valid, img_t_valid, q=EDGE_Q, pow_=EDGE_POW
+                        )
                     
                     # [New] Compute FFL (with float32 cast fix)
                     if FFL_BASE_WEIGHT > 0:
@@ -1012,7 +1122,7 @@ def main():
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
                     + w['lpips']*loss_lpips
-                    + EDGE_GRAD_WEIGHT * loss_edge + FLAT_HF_WEIGHT * loss_flat_hf 
+                    + w['edge_grad'] * loss_edge + w['flat_hf'] * loss_flat_hf 
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
@@ -1028,6 +1138,10 @@ def main():
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'lp': f"{loss_lpips:.3f}",
+                    'edge': f"{loss_edge.item():.3f}",
+                    'flat_hf': f"{loss_flat_hf.item():.3f}",
+                    'w_edge': f"{w['edge_grad']:.3f}",
+                    'w_flat': f"{w['flat_hf']:.3f}",
                     'ffl': f"{loss_ffl.item():.4f}",
                 })
 
