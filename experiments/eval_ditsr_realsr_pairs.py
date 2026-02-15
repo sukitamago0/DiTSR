@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Evaluate DiTSR checkpoint on a small list of real-SR pairs.
+"""Evaluate DiTSR checkpoint on full real-SR datasets.
 
-- Loads model components from a training script (by file path), e.g.
-  experiments/train_4090_auto_v9_gan_edge_gtmask.py
-- Runs inference for user-provided LR/HR image pairs.
-- Reports PSNR, SSIM, LPIPS for:
-  1) DiTSR prediction
-  2) Bicubic-upsample baseline
+This script evaluates whole datasets (not just a few example images), reports SR metrics,
+and saves only a small preview subset of predictions per dataset.
 
-Note:
-- DiTSR v8/v9 scripts are trained around 512x512 crops, so default behavior resizes
-  LR/HR to 512 for inference/metrics (`--eval-size 512`).
+Default datasets:
+- DRealSR Canon x4:
+  HR dir: /data/DRealSR/HR
+  LR dir: /data/DRealSR/LR
+  Pair rule: <name>_x4.png <-> <name>_x1.png
+- RealSR Canon x4:
+  HR dir: /data/RealSR/Canon/Test/4
+  LR dir: /data/RealSR/Canon/Test/4
+  Pair rule: *_HR.png <-> *_LR4.png
+- RealSR Nikon x4:
+  HR dir: /data/RealSR/Nikon/Test/4
+  LR dir: /data/RealSR/Nikon/Test/4
+  Pair rule: *_HR.png <-> *_LR4.png
 """
 
 import argparse
@@ -18,6 +24,7 @@ import csv
 import importlib.util
 import json
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -125,26 +132,48 @@ def infer_one(mod, pixart, adapter, vae, y_embed, d_info, lr_m11, steps: int, cf
     return pred_m11
 
 
-def parse_pairs(arg: str):
-    if arg:
-        return json.loads(arg)
+def collect_pairs_drealsr(hr_dir: Path, lr_dir: Path) -> List[Dict[str, str]]:
+    pairs = []
+    for hr in sorted(hr_dir.glob("*_x4.png")):
+        stem = hr.stem[:-3] if hr.stem.endswith("_x4") else hr.stem
+        lr = lr_dir / f"{stem}_x1.png"
+        if lr.exists():
+            pairs.append({"name": stem, "hr": str(hr), "lr": str(lr)})
+    return pairs
+
+
+def collect_pairs_realsr(dir_path: Path, prefix: str) -> List[Dict[str, str]]:
+    pairs = []
+    for hr in sorted(dir_path.glob(f"{prefix}*_HR.png")):
+        stem = hr.stem.replace("_HR", "")
+        lr = dir_path / f"{stem}_LR4.png"
+        if lr.exists():
+            pairs.append({"name": stem, "hr": str(hr), "lr": str(lr)})
+    return pairs
+
+
+def build_default_datasets() -> List[Dict]:
     return [
         {
-            "name": "DRealSR_Canon_10",
-            "hr": "/data/DRealSR/HR/Canon_10_x4.png",
-            "lr": "/data/DRealSR/LR/Canon_10_x1.png",
+            "dataset": "DRealSR_Canon_x4",
+            "pairs": collect_pairs_drealsr(Path("/data/DRealSR/HR"), Path("/data/DRealSR/LR")),
         },
         {
-            "name": "RealSR_Canon_001",
-            "hr": "/data/RealSR/Canon/Test/4/Canon_001_HR.png",
-            "lr": "/data/RealSR/Canon/Test/4/Canon_001_LR4.png",
+            "dataset": "RealSR_Canon_x4",
+            "pairs": collect_pairs_realsr(Path("/data/RealSR/Canon/Test/4"), "Canon_"),
         },
         {
-            "name": "RealSR_Nikon_001",
-            "hr": "/data/RealSR/Nikon/Test/4/Nikon_001_HR.png",
-            "lr": "/data/RealSR/Nikon/Test/4/Nikon_001_LR4.png",
+            "dataset": "RealSR_Nikon_x4",
+            "pairs": collect_pairs_realsr(Path("/data/RealSR/Nikon/Test/4"), "Nikon_"),
         },
     ]
+
+
+def parse_datasets(arg: str) -> List[Dict]:
+    if arg:
+        datasets = json.loads(arg)
+        return datasets
+    return build_default_datasets()
 
 
 def main():
@@ -153,9 +182,10 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--cfg", type=float, default=3.0)
-    ap.add_argument("--eval-size", type=int, default=512, help="Resize LR/HR to this square size before inference/metrics")
+    ap.add_argument("--eval-size", type=int, default=512)
     ap.add_argument("--crop-border", type=int, default=4)
-    ap.add_argument("--pairs-json", default="", help="JSON list of {name,hr,lr}; default uses the 3 pairs from request")
+    ap.add_argument("--datasets-json", default="", help="JSON list: [{dataset, pairs:[{name,hr,lr}, ...]}]")
+    ap.add_argument("--save-max-per-dataset", type=int, default=5, help="Save only N prediction images per dataset")
     ap.add_argument("--out-csv", default="experiments_results/realsr_eval/results.csv")
     ap.add_argument("--out-json", default="experiments_results/realsr_eval/summary.json")
     ap.add_argument("--save-preds-dir", default="experiments_results/realsr_eval/preds")
@@ -204,84 +234,111 @@ def main():
         "aspect_ratio": torch.tensor([1.0], device=device),
     }
 
-    out_pred_dir = Path(args.save_preds_dir)
-    out_pred_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
+    out_pred_root = Path(args.save_preds_dir)
+    out_pred_root.mkdir(parents=True, exist_ok=True)
 
-    pairs = parse_pairs(args.pairs_json)
+    rows: List[Dict] = []
+    datasets = parse_datasets(args.datasets_json)
     cb = int(args.crop_border)
 
-    for item in pairs:
-        name, hr_p, lr_p = item["name"], item["hr"], item["lr"]
-        hr = load_png_chw01(hr_p).unsqueeze(0).to(device)
-        lr = load_png_chw01(lr_p).unsqueeze(0).to(device)
-        hr = resize_bchw(hr, args.eval_size)
-        lr = resize_bchw(lr, args.eval_size)
+    for d in datasets:
+        dname = d["dataset"]
+        pairs = d.get("pairs", [])
+        saved_count = 0
+        ddir = out_pred_root / dname
+        ddir.mkdir(parents=True, exist_ok=True)
 
-        hr_m11 = (hr * 2 - 1).clamp(-1, 1)
-        lr_m11 = (lr * 2 - 1).clamp(-1, 1)
+        for item in pairs:
+            name, hr_p, lr_p = item["name"], item["hr"], item["lr"]
+            hr_path, lr_path = Path(hr_p), Path(lr_p)
+            if (not hr_path.exists()) or (not lr_path.exists()):
+                continue
 
-        pred_m11 = infer_one(mod, pixart, adapter, vae, y_embed, d_info, lr_m11, args.steps, args.cfg)
-        pred01 = (pred_m11 + 1) * 0.5
+            hr = load_png_chw01(str(hr_path)).unsqueeze(0).to(device)
+            lr = load_png_chw01(str(lr_path)).unsqueeze(0).to(device)
+            hr = resize_bchw(hr, args.eval_size)
+            lr = resize_bchw(lr, args.eval_size)
 
-        bic01 = resize_bchw(lr, args.eval_size)
+            hr_m11 = (hr * 2 - 1).clamp(-1, 1)
+            lr_m11 = (lr * 2 - 1).clamp(-1, 1)
 
-        if cb > 0:
-            pr_c = pred01[..., cb:-cb, cb:-cb]
-            bi_c = bic01[..., cb:-cb, cb:-cb]
-            hr_c = hr[..., cb:-cb, cb:-cb]
-        else:
-            pr_c, bi_c, hr_c = pred01, bic01, hr
+            pred_m11 = infer_one(mod, pixart, adapter, vae, y_embed, d_info, lr_m11, args.steps, args.cfg)
+            pred01 = (pred_m11 + 1) * 0.5
+            bic01 = resize_bchw(lr, args.eval_size)
 
-        py, hy = rgb01_to_y01(pr_c), rgb01_to_y01(hr_c)
-        by = rgb01_to_y01(bi_c)
+            if cb > 0:
+                pr_c = pred01[..., cb:-cb, cb:-cb]
+                bi_c = bic01[..., cb:-cb, cb:-cb]
+                hr_c = hr[..., cb:-cb, cb:-cb]
+            else:
+                pr_c, bi_c, hr_c = pred01, bic01, hr
 
-        lp_pred = float(lpips_fn((pred01 * 2 - 1).clamp(-1, 1), (hr * 2 - 1).clamp(-1, 1)).mean().item())
-        lp_bic = float(lpips_fn((bic01 * 2 - 1).clamp(-1, 1), (hr * 2 - 1).clamp(-1, 1)).mean().item())
+            py, hy = rgb01_to_y01(pr_c), rgb01_to_y01(hr_c)
+            by = rgb01_to_y01(bi_c)
 
-        row = {
-            "name": name,
-            "psnr_rgb_pred": psnr01(pr_c, hr_c),
-            "ssim_y_pred": float(tm_ssim(py, hy, data_range=1.0).item()),
-            "lpips_pred": lp_pred,
-            "psnr_rgb_bic": psnr01(bi_c, hr_c),
-            "ssim_y_bic": float(tm_ssim(by, hy, data_range=1.0).item()),
-            "lpips_bic": lp_bic,
+            row = {
+                "dataset": dname,
+                "name": name,
+                "psnr_rgb_pred": psnr01(pr_c, hr_c),
+                "ssim_y_pred": float(tm_ssim(py, hy, data_range=1.0).item()),
+                "lpips_pred": float(lpips_fn((pred01 * 2 - 1).clamp(-1, 1), (hr * 2 - 1).clamp(-1, 1)).mean().item()),
+                "psnr_rgb_bic": psnr01(bi_c, hr_c),
+                "ssim_y_bic": float(tm_ssim(by, hy, data_range=1.0).item()),
+                "lpips_bic": float(lpips_fn((bic01 * 2 - 1).clamp(-1, 1), (hr * 2 - 1).clamp(-1, 1)).mean().item()),
+            }
+            rows.append(row)
+
+            if saved_count < int(args.save_max_per_dataset):
+                save_path = ddir / f"{name}.png"
+                img = (pred01[0].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+                Image.fromarray(img).save(save_path)
+                saved_count += 1
+
+    out_csv = Path(args.out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        fields = [
+            "dataset", "name",
+            "psnr_rgb_pred", "ssim_y_pred", "lpips_pred",
+            "psnr_rgb_bic", "ssim_y_bic", "lpips_bic",
+        ]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    summary_by_dataset: Dict[str, Dict[str, float]] = {}
+    for dname in sorted({r["dataset"] for r in rows}):
+        sub = [r for r in rows if r["dataset"] == dname]
+        if not sub:
+            continue
+        summary_by_dataset[dname] = {
+            "n": len(sub),
+            "psnr_rgb_pred": float(np.mean([x["psnr_rgb_pred"] for x in sub])),
+            "ssim_y_pred": float(np.mean([x["ssim_y_pred"] for x in sub])),
+            "lpips_pred": float(np.mean([x["lpips_pred"] for x in sub])),
+            "psnr_rgb_bic": float(np.mean([x["psnr_rgb_bic"] for x in sub])),
+            "ssim_y_bic": float(np.mean([x["ssim_y_bic"] for x in sub])),
+            "lpips_bic": float(np.mean([x["lpips_bic"] for x in sub])),
         }
-        rows.append(row)
 
-        save_path = out_pred_dir / f"{name}.png"
-        img = (pred01[0].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-        Image.fromarray(img).save(save_path)
-
-    summary = {
+    overall = {
         "n": len(rows),
         "eval_size": args.eval_size,
         "crop_border": cb,
         "steps": args.steps,
         "cfg": args.cfg,
-        "mean": {
-            k: float(np.mean([r[k] for r in rows])) for k in rows[0].keys() if k != "name"
-        } if rows else {},
-        "rows": rows,
+        "per_dataset": summary_by_dataset,
     }
-
-    out_csv = Path(args.out_csv)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["name"])
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    out_json.write_text(json.dumps(overall, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(json.dumps(summary["mean"], indent=2, ensure_ascii=False))
+    print(json.dumps(overall, indent=2, ensure_ascii=False))
     print(f"✅ Saved CSV: {out_csv}")
     print(f"✅ Saved JSON: {out_json}")
-    print(f"✅ Saved preds: {out_pred_dir}")
+    print(f"✅ Saved preds root: {out_pred_root} (max {args.save_max_per_dataset}/dataset)")
 
 
 if __name__ == "__main__":
