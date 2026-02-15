@@ -177,6 +177,7 @@ FAST_DEV_RUN = os.getenv("FAST_DEV_RUN", "0") == "1"
 FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
 FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
 FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
+MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "0"))
 
 # --- User Config Block Start ---
 BATCH_SIZE = 1
@@ -1060,7 +1061,7 @@ def main():
     _ema_to_device(ema_pixart, DEVICE)
     _ema_to_device(ema_adapter, DEVICE)  # safety: keep EMA tensors on GPU
     print("🚀 DiT-SR V9 Adversarial Training Started (InstanceNorm D, Correct Grad Flow, FFL, State Saving).")
-    max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
+    max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
 
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps: break

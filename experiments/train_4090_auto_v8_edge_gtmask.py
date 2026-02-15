@@ -90,6 +90,7 @@ FAST_DEV_RUN = os.getenv("FAST_DEV_RUN", "0") == "1"
 FAST_TRAIN_STEPS = int(os.getenv("FAST_TRAIN_STEPS", "10"))
 FAST_VAL_BATCHES = int(os.getenv("FAST_VAL_BATCHES", "2"))
 FAST_VAL_STEPS = int(os.getenv("FAST_VAL_STEPS", "10"))
+MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "0"))
 
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
@@ -928,7 +929,7 @@ def main():
     ep_start, step, best = resume(pixart, adapter, optimizer, dl_gen)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init, FFL).")
-    max_steps = FAST_TRAIN_STEPS if FAST_DEV_RUN else None
+    max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
 
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps: break
