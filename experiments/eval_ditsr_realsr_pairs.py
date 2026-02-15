@@ -14,6 +14,7 @@ Fixes vs earlier draft:
 Outputs:
 - JSON summary (averaged metrics only).
 - Up to N 4-panel previews per dataset: [LR-upsampled | GT(HR) | Pred | Bicubic].
+- Supports inference-time sweep knobs: CFG, LQ-init on/off, and LQ-init strength.
 """
 
 import argparse
@@ -116,7 +117,7 @@ def load_ckpt_into_models(ckpt_path: str, pixart, adapter, use_ema: bool = True)
 
 
 @torch.no_grad()
-def infer_one(mod, pixart, adapter, vae, y_embed, lr_m11, steps: int, cfg_scale: float, gen: torch.Generator):
+def infer_one(mod, pixart, adapter, vae, y_embed, lr_m11, steps: int, cfg_scale: float, gen: torch.Generator, use_lq_init: bool, lq_init_strength: float):
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
         beta_start=0.0001,
@@ -130,11 +131,11 @@ def infer_one(mod, pixart, adapter, vae, y_embed, lr_m11, steps: int, cfg_scale:
 
     z_lr = vae.encode(lr_m11).latent_dist.mean * vae.config.scaling_factor
 
-    if getattr(mod, "USE_LQ_INIT", True):
+    if use_lq_init:
         latents, run_timesteps = mod.get_lq_init_latents(
             z_lr.to(mod.COMPUTE_DTYPE), scheduler, steps,
             gen,
-            float(getattr(mod, "LQ_INIT_STRENGTH", 0.1)), mod.COMPUTE_DTYPE,
+            float(lq_init_strength), mod.COMPUTE_DTYPE,
         )
     else:
         latents = torch.randn_like(z_lr)
@@ -230,6 +231,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--cfg", type=float, default=3.0)
+    ap.add_argument("--use-lq-init", action="store_true", help="Force enable LQ-init in inference")
+    ap.add_argument("--no-lq-init", action="store_true", help="Force disable LQ-init in inference")
+    ap.add_argument("--lq-init-strength", type=float, default=None, help="Override LQ-init strength (default follows train script)")
     ap.add_argument("--crop-size", type=int, default=512, help="Center crop size in HR space; 0 uses full shortest side")
     ap.add_argument("--crop-border", type=int, default=4)
     ap.add_argument("--datasets-json", default="", help="JSON list: [{dataset, pairs:[{name,hr,lr}]}]")
@@ -273,6 +277,16 @@ def main():
     adapter.eval()
 
     y_embed = torch.load(mod.T5_EMBED_PATH, map_location="cpu")["prompt_embeds"].unsqueeze(1).to(device)
+    if args.use_lq_init and args.no_lq_init:
+        raise ValueError("--use-lq-init and --no-lq-init are mutually exclusive")
+    default_use_lq_init = bool(getattr(mod, "USE_LQ_INIT", True))
+    use_lq_init = default_use_lq_init
+    if args.use_lq_init:
+        use_lq_init = True
+    if args.no_lq_init:
+        use_lq_init = False
+    lq_init_strength = float(getattr(mod, "LQ_INIT_STRENGTH", 0.1) if args.lq_init_strength is None else args.lq_init_strength)
+
     datasets = json.loads(args.datasets_json) if args.datasets_json else build_default_datasets()
     cb = int(args.crop_border)
     out_panel_root = Path(args.save_panels_dir)
@@ -306,7 +320,7 @@ def main():
             lr = load_png_chw01(str(lr_path)).unsqueeze(0).to(device)
             hr, lr_up = align_pair_train_style(hr, lr, int(args.crop_size))
 
-            pred_m11 = infer_one(mod, pixart, adapter, vae, y_embed, (lr_up * 2 - 1).clamp(-1, 1), args.steps, args.cfg, gen)
+            pred_m11 = infer_one(mod, pixart, adapter, vae, y_embed, (lr_up * 2 - 1).clamp(-1, 1), args.steps, args.cfg, gen, use_lq_init, lq_init_strength)
             pred01 = (pred_m11 + 1) * 0.5
             bic01 = lr_up.clone()
 
@@ -345,6 +359,8 @@ def main():
         "crop_border": cb,
         "steps": args.steps,
         "cfg": args.cfg,
+        "use_lq_init": bool(use_lq_init),
+        "lq_init_strength": float(lq_init_strength),
         "use_ema": bool(args.use_ema),
         "ema_applied": ema_applied,
         "per_dataset": per_dataset,
@@ -356,6 +372,13 @@ def main():
             "psnr_y_bic", "psnr_rgb_bic", "ssim_y_bic", "lpips_bic",
         ]
         overall["overall_weighted"] = {k: float(sum(m[k] * m["n"] for m in valid) / denom) for k in keys}
+        ow = overall["overall_weighted"]
+        overall["delta_pred_minus_bic"] = {
+            "psnr_y": float(ow["psnr_y_pred"] - ow["psnr_y_bic"]),
+            "psnr_rgb": float(ow["psnr_rgb_pred"] - ow["psnr_rgb_bic"]),
+            "ssim_y": float(ow["ssim_y_pred"] - ow["ssim_y_bic"]),
+            "lpips": float(ow["lpips_pred"] - ow["lpips_bic"]),
+        }
 
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
