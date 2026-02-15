@@ -11,13 +11,35 @@ import subprocess
 from pathlib import Path
 
 
-def run_once(base_cmd, cfg, use_lq_init, lq_init_strength, out_json):
+def detect_eval_cli_support(eval_script: str):
+    """Detect optional flags supported by evaluator.
+
+    This makes sweep robust when users accidentally run with an older evaluator
+    that does not yet include LQ-init control flags.
+    """
+    out = subprocess.check_output(["python", eval_script, "--help"], text=True)
+    return {
+        "use_lq_init": "--use-lq-init" in out,
+        "no_lq_init": "--no-lq-init" in out,
+        "lq_init_strength": "--lq-init-strength" in out,
+    }
+
+
+def run_once(base_cmd, cfg, use_lq_init, lq_init_strength, out_json, cli_support):
     cmd = list(base_cmd)
     cmd += ["--cfg", str(cfg), "--out-json", str(out_json)]
     if use_lq_init:
-        cmd += ["--use-lq-init", "--lq-init-strength", str(lq_init_strength)]
+        if cli_support["use_lq_init"]:
+            cmd += ["--use-lq-init"]
+        if cli_support["lq_init_strength"]:
+            cmd += ["--lq-init-strength", str(lq_init_strength)]
     else:
-        cmd += ["--no-lq-init"]
+        if cli_support["no_lq_init"]:
+            cmd += ["--no-lq-init"]
+        else:
+            # Older evaluator cannot disable LQ-init; keep sweep runnable.
+            print("⚠️ Evaluator does not support --no-lq-init; skipping this config.")
+            return None
     subprocess.run(cmd, check=True)
     data = json.loads(Path(out_json).read_text())
     ow = data.get("overall_weighted", {})
@@ -70,10 +92,15 @@ def main():
     if args.use_ema:
         base_cmd.append("--use-ema")
 
+    cli_support = detect_eval_cli_support("experiments/eval_ditsr_realsr_pairs.py")
+    print(f"CLI support detected: {cli_support}")
+
     rows = []
     for i, (cfg, (use_lq_init, lq_init_strength)) in enumerate(itertools.product(cfgs, inits)):
         out_json = out_dir / f"run_{i:02d}.json"
-        row = run_once(base_cmd, cfg, use_lq_init, lq_init_strength, out_json)
+        row = run_once(base_cmd, cfg, use_lq_init, lq_init_strength, out_json, cli_support)
+        if row is None:
+            continue
         row["json"] = str(out_json)
         rows.append(row)
 
